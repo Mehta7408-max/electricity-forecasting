@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  # GNN API Service
+  gnn-api:
+    build: .
+    container_name: gnn-electricity-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python gnn_api.py
+    restart: unless-stopped
+    networks:
+      - gnn-network
+
+  # Streamlit Dashboard Service
+  gnn-dashboard:
+    build: .
+    container_name: gnn-electricity-dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: streamlit run gnn_dashboard.py --server.port=8501 --server.address=0.0.0.0
+    restart: unless-stopped
+    networks:
+      - gnn-network
+    depends_on:
+      - gnn-api
+
+networks:
+  gnn-network:
+    driver: bridge
+
+volumes:
+  data:
+  artifacts:
