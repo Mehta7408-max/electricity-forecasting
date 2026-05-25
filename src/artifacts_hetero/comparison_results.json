@@ -1,0 +1,13 @@
+{
+  "Homogeneous GCN": {
+    "type": "homogeneous",
+    "node_types": 1,
+    "edge_types": 5,
+    "metrics": {
+      "MAE": 0.5407829284667969,
+      "RMSE": 0.6804455518722534,
+      "MAPE": 257.0953607559204,
+      "R2": 0.5241574048995972
+    }
+  }
+}

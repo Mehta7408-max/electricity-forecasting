@@ -1,5 +1,6 @@
+# OVERWRITE EXACTLY: src/gnn_train.py
 """
-Training Module - Train GNN models for electricity price forecasting
+Training Module - Train Spatial-Temporal Homogeneous GNN models for electricity price forecasting
 """
 import pickle
 import torch
@@ -9,14 +10,15 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 from pathlib import Path
 import json
-from datetime import datetime
+from sklearn.metrics import mean_absolute_error, r2_score
 
 from gnn_models import create_model
 from gnn_config import GNN_CONFIG, DEVICE, ARTIFACTS_DIR, GRAPH_DIR
+from gnn_graph_builder import load_graph
 
 
 class GNNTrainer:
-    """Trainer for GNN models."""
+    """Trainer for GNN models operating over flat spatial-temporal grids."""
     
     def __init__(self, model, data, config=None):
         """
@@ -58,15 +60,15 @@ class GNNTrainer:
         self.patience_counter = 0
     
     def train_epoch(self):
-        """Train for one epoch."""
+        """Train for one epoch across all active node coordinates."""
         self.model.train()
         self.optimizer.zero_grad()
         
         # Forward pass
         out = self.model(self.data.x, self.data.edge_index)
         
-        # Compute loss on training nodes
-        loss = F.mse_loss(out[self.data.train_mask], self.data.y[self.data.train_mask])
+        # Compute loss on training nodes (includes historical states of all 4 zones)
+        loss = F.mse_loss(out[self.data.train_mask].view(-1), self.data.y[self.data.train_mask].view(-1))
         
         # Backward pass
         loss.backward()
@@ -74,68 +76,51 @@ class GNNTrainer:
         
         # Compute MAE
         with torch.no_grad():
-            mae = F.l1_loss(out[self.data.train_mask], self.data.y[self.data.train_mask])
+            mae = F.l1_loss(out[self.data.train_mask].view(-1), self.data.y[self.data.train_mask].view(-1))
         
         return loss.item(), mae.item()
     
     @torch.no_grad()
     def evaluate(self, mask):
-        """Evaluate model on given mask."""
+        """Evaluate model performance on the target verification mask."""
         self.model.eval()
         
         out = self.model(self.data.x, self.data.edge_index)
         
-        loss = F.mse_loss(out[mask], self.data.y[mask])
-        mae = F.l1_loss(out[mask], self.data.y[mask])
+        loss = F.mse_loss(out[mask].view(-1), self.data.y[mask].view(-1))
+        mae = F.l1_loss(out[mask].view(-1), self.data.y[mask].view(-1))
         
         return loss.item(), mae.item()
     
     def train(self, num_epochs=None, early_stopping_patience=None):
-        """
-        Train the model.
-        
-        Args:
-            num_epochs: Number of epochs to train.
-            early_stopping_patience: Patience for early stopping.
-        
-        Returns:
-            Dictionary with training history.
-        """
+        """Train the homogeneous spatial-temporal model."""
         num_epochs = num_epochs or self.config['num_epochs']
         early_stopping_patience = early_stopping_patience or self.config['early_stopping_patience']
         
-        print(f"\n🚀 Starting training for {num_epochs} epochs...")
+        print(f"\n🚀 Starting training loop for {num_epochs} epochs...")
         print(f"Device: {DEVICE}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
         for epoch in range(1, num_epochs + 1):
-            # Train
             train_loss, train_mae = self.train_epoch()
-            
-            # Validate
             val_loss, val_mae = self.evaluate(self.data.val_mask)
             
-            # Update scheduler
             self.scheduler.step(val_loss)
             
-            # Store history
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
             self.history['train_mae'].append(train_mae)
             self.history['val_mae'].append(val_mae)
             self.history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
             
-            # Check for improvement
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.best_epoch = epoch
                 self.patience_counter = 0
-                # Save best model
                 self.save_checkpoint('best_model.pt')
             else:
                 self.patience_counter += 1
             
-            # Print progress
             if epoch % 10 == 0 or epoch == 1:
                 print(f"Epoch {epoch:3d} | "
                       f"Train Loss: {train_loss:.4f} | "
@@ -143,25 +128,21 @@ class GNNTrainer:
                       f"Train MAE: {train_mae:.4f} | "
                       f"Val MAE: {val_mae:.4f}")
             
-            # Early stopping
             if self.patience_counter >= early_stopping_patience:
                 print(f"\n⏹️  Early stopping triggered at epoch {epoch}")
                 print(f"Best validation loss: {self.best_val_loss:.4f} at epoch {self.best_epoch}")
                 break
         
-        print(f"\n✅ Training complete!")
-        print(f"Best epoch: {self.best_epoch}")
-        print(f"Best validation loss: {self.best_val_loss:.4f}")
-        
+        print(f"\n✅ Training sequence complete!")
         return self.history
     
     def test(self):
         print("\n📊 Evaluating on test set...")
         
-        # Load best model
+        # Reload structural parameters
         self.load_checkpoint('best_model.pt')
         
-        # Load the target scaler to reverse normalization
+        # Load target scaler to handle inverse feature translations
         scaler_path = GRAPH_DIR / "scaler.pkl"
         with open(scaler_path, 'rb') as f:
             scalers = pickle.load(f)
@@ -171,44 +152,39 @@ class GNNTrainer:
         with torch.no_grad():
             out = self.model(self.data.x, self.data.edge_index)
             
-            # Extract test predictions and targets (still in scaled space)
+            # Extract target indices corresponding to the test block array
             y_pred_scaled = out[self.data.test_mask].cpu().numpy().reshape(-1, 1)
             y_true_scaled = self.data.y[self.data.test_mask].cpu().numpy().reshape(-1, 1)
             
-            # Inverse transform back to raw DKK/kWh prices
+            # Invert back to real-scale DKK market values
             y_pred = target_scaler.inverse_transform(y_pred_scaled).flatten()
             y_true = target_scaler.inverse_transform(y_true_scaled).flatten()
             
-            # Calculate standard baseline metrics on real prices
-            mae = np.mean(np.abs(y_pred - y_true))
-            rmse = np.sqrt(np.mean((y_pred - y_true) ** 2))
+            # Structural assessment calculation
+            mae = float(mean_absolute_error(y_true, y_pred))
+            rmse = float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
+            r2 = float(r2_score(y_true, y_pred))
             
-            # R² Score
-            ss_res = np.sum((y_true - y_pred) ** 2)
-            ss_tot = np.sum((y_true - y_true.mean()) ** 2)
-            r2 = 1 - (ss_res / ss_tot)
-            
-            # Robust SMAPE calculation to handle zero/negative pricing safely
-            smape = np.mean(2.0 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred) + 1e-8)) * 100
+            # Robust SMAPE fallback to bypass zero/negative market values cleanly
+            smape = float(np.mean(2.0 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred) + 1e-8)) * 100)
         
         metrics = {
-            'test_mae': float(mae),
-            'test_rmse': float(rmse),
-            'test_r2': float(r2),
-            'test_mape': float(smape)
+            'mae': mae,
+            'rmse': rmse,
+            'r2': r2,
+            'mape': smape
         }
         
-        print(f"\n📈 Real-Scale Test Results:")
-        print(f"   MAE:  {mae:.4f} DKK/kWh")
-        print(f"   RMSE: {rmse:.4f} DKK/kWh")
+        print(f"\n📈 Real-Scale Multi-Zone Test Results (DK1 + DK2):")
+        print(f"   MAE:  {mae:.4f} DKK")
+        print(f"   RMSE: {rmse:.4f} DKK")
         print(f"   R²:   {r2:.4f}")
         print(f"   SMAPE: {smape:.2f}%")
         
         return metrics
-         
     
     def save_checkpoint(self, filename):
-        """Save model checkpoint."""
+        ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
         checkpoint_path = ARTIFACTS_DIR / filename
         torch.save({
             'model_state_dict': self.model.state_dict(),
@@ -220,10 +196,8 @@ class GNNTrainer:
         }, checkpoint_path)
     
     def load_checkpoint(self, filename):
-        """Load model checkpoint."""
         checkpoint_path = ARTIFACTS_DIR / filename
         checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-        
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -232,62 +206,41 @@ class GNNTrainer:
         self.best_epoch = checkpoint['best_epoch']
     
     def save_history(self, filename='training_history.json'):
-        """Save training history to JSON."""
+        ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
         history_path = ARTIFACTS_DIR / filename
-        
         with open(history_path, 'w') as f:
             json.dump(self.history, f, indent=2)
-        
-        print(f"💾 Saved training history to {history_path}")
+        print(f"💾 Saved training history data to {history_path}")
 
 
 def train_gnn_model(data, model_type='GCN', config=None):
-    """
-    Train a GNN model.
-    
-    Args:
-        data: PyTorch Geometric Data object.
-        model_type: Type of GNN model.
-        config: Training configuration.
-    
-    Returns:
-        Trained model and metrics.
-    """
     config = config or GNN_CONFIG
-    
-    # Create model
     num_features = data.x.shape[1]
+    
     model = create_model(model_type, num_features, config)
     
-    print(f"\n🔧 Created {model_type} model")
-    print(f"   Input features: {num_features}")
-    print(f"   Hidden channels: {config['hidden_channels']}")
-    print(f"   Number of layers: {config['num_layers']}")
-    print(f"   Dropout: {config['dropout']}")
+    print(f"\n🔧 Initializing {model_type} Core Model Architecture...")
+    print(f"   Input features  : {num_features}")
+    print(f"   Hidden channels : {config['hidden_channels']}")
+    print(f"   Network layers  : {config['num_layers']}")
     
-    # Create trainer
     trainer = GNNTrainer(model, data, config)
-    
-    # Train
     history = trainer.train()
-    
-    # Test
     metrics = trainer.test()
     
-    # Save history
+    # Save the evaluation dictionary package into history format for compare_models.py
+    trainer.history['val_mae'] = metrics['mae']
+    trainer.history['val_rmse'] = metrics['rmse']
+    trainer.history['val_r2'] = metrics['r2']
     trainer.save_history()
     
     return model, metrics, history
 
 
 if __name__ == "__main__":
-    from gnn_graph_builder import load_graph
-    
-    # Load graph
-    print("📂 Loading graph...")
+    # 1. Fetch graph from builder file
     data = load_graph()
     
-    # Train model
+    # 2. Fire optimization execution run
     model, metrics, history = train_gnn_model(data, model_type='GCN')
-    
-    print("\n✅ Training pipeline complete!")
+    print("\n✅ Homogeneous Spatial-Temporal Mesh Baseline Run Finalized!")
