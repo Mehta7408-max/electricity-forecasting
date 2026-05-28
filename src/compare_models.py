@@ -23,6 +23,7 @@ def load_metrics():
     root_dir = base_dir.parent if base_dir.name == 'src' else base_dir
 
     xgb_m    = _load_json(root_dir / "artifacts" / "xgboost_metrics.json")
+    homo_m   = _load_json(base_dir / "artifacts" / "homo_gnn_metrics.json")
     hetero_m = _load_json(root_dir / "src" / "artifacts_hetero" / "hetero_metrics_clean.json")
     gat_m    = _load_json(root_dir / "src" / "artifacts_hetero" / "gat_metrics_clean.json")
     da_m     = _load_json(root_dir / "src" / "artifacts_hetero" / "day_ahead_results.json")
@@ -46,9 +47,16 @@ def load_metrics():
             'R²':        round(xgb_m.get('r2', 0), 4),
         }
 
-    leaderboard['2. Homogeneous GNN (GCN)'] = {
-        'MAE (DKK)': 110.08, 'SMAPE': '38.20%', 'R²': 0.7912,
-    }
+    if homo_m:
+        leaderboard['2. Homogeneous GNN (GraphSAGE)'] = {
+            'MAE (DKK)': round(homo_m.get('mae', 0), 2),
+            'SMAPE':     f"{round(homo_m.get('smape', 0), 2)}%",
+            'R²':        round(homo_m.get('r2', 0), 4),
+        }
+    else:
+        leaderboard['2. Homogeneous GNN (GraphSAGE)'] = {
+            'MAE (DKK)': '(run homo_retrain.py)', 'SMAPE': '—', 'R²': '—',
+        }
 
     if hetero_m:
         leaderboard['3. HeteroSAGE (our model)'] = {
