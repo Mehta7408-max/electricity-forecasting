@@ -1,7 +1,7 @@
 # OVERWRITE EXACTLY: src/compare_models.py
 """
 Unified project leaderboard — covers all evaluation dimensions:
-  1. Baseline comparison (XGBoost / Homogeneous / Hetero SAGE / HeteroGAT)
+  1. Baseline comparison (XGBoost / Homogeneous GNN / HeteroSAGE)
   2. Per-zone breakdown (DK1, DK2, HYDRO, DE)
   3. Ablation study summary (edge-type contributions)
   4. Robustness summary (MAE degradation under perturbation)
@@ -25,7 +25,6 @@ def load_metrics():
     xgb_m    = _load_json(root_dir / "artifacts" / "xgboost_metrics.json")
     homo_m   = _load_json(base_dir / "artifacts" / "homo_gnn_metrics.json")
     hetero_m = _load_json(root_dir / "src" / "artifacts_hetero" / "hetero_metrics_clean.json")
-    gat_m    = _load_json(root_dir / "src" / "artifacts_hetero" / "gat_metrics_clean.json")
     da_m     = _load_json(root_dir / "src" / "artifacts_hetero" / "day_ahead_results.json")
     abl_m    = _load_json(root_dir / "src" / "artifacts_hetero" / "ablation_results.json")
     rob_m    = _load_json(root_dir / "src" / "artifacts_hetero" / "robustness_results.json")
@@ -63,13 +62,6 @@ def load_metrics():
             'MAE (DKK)': round(hetero_m.get('mae', 0), 2),
             'SMAPE':     f"{round(hetero_m.get('smape', 0), 2)}%",
             'R²':        round(hetero_m.get('r2', 0), 4),
-        }
-
-    if gat_m:
-        leaderboard['4. HeteroGAT (4 heads)'] = {
-            'MAE (DKK)': round(gat_m.get('mae', 0), 2),
-            'SMAPE':     f"{round(gat_m.get('smape', 0), 2)}%",
-            'R²':        round(gat_m.get('r2', 0), 4),
         }
 
     df_lb = pd.DataFrame(leaderboard).T
