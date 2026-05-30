@@ -36,12 +36,16 @@ def train_xgboost_baseline():
         df_dk1['zone_id'] = 0
         df_dk2['zone_id'] = 1
 
-        # 3. Inject neighborhood inputs to maintain feature parity with GNN designs
-        df_dk1['neighbor_price_de'] = df_de['price_dkk']
-        df_dk1['neighbor_price_hydro'] = df_hydro['price_dkk']
+        # 3. Inject neighborhood inputs to maintain feature parity with GNN designs.
+        #    Use the neighbor zones' 24h-lagged price (same hour, previous day) —
+        #    NOT the target-hour price. Tomorrow's DE/HYDRO prices clear in the same
+        #    day-ahead auction and are unknown at gate closure, so using them would
+        #    leak. The 24h lag is published the day before and is leakage-free.
+        df_dk1['neighbor_price_de'] = df_de['price_lag_24h']
+        df_dk1['neighbor_price_hydro'] = df_hydro['price_lag_24h']
 
-        df_dk2['neighbor_price_de'] = df_de['price_dkk']
-        df_dk2['neighbor_price_hydro'] = df_hydro['price_dkk']
+        df_dk2['neighbor_price_de'] = df_de['price_lag_24h']
+        df_dk2['neighbor_price_hydro'] = df_hydro['price_lag_24h']
 
         # Stack features vertically
         df = pd.concat([df_dk1, df_dk2], ignore_index=True)
@@ -56,8 +60,8 @@ def train_xgboost_baseline():
 
         feature_cols = [
             'hour_of_day', 'minute', 'zone_id',
-            'price_lag_1h', 'price_lag_2h', 'price_lag_6h',
-            'price_rolling_6h_mean', 'price_rolling_6h_std',
+            'price_lag_24h', 'price_lag_48h', 'price_lag_168h',
+            'price_rolling_24h_mean', 'price_rolling_24h_std',
             'neighbor_price_de', 'neighbor_price_hydro',
             'temperature_c', 'wind_speed_ms', 'cloud_cover_pct'
         ]
