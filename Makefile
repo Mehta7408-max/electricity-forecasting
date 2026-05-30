@@ -1,4 +1,4 @@
-.PHONY: help train-all train-hetero train-homo train-xgboost compare serve mlflow-ui docker-up lint
+.PHONY: help train-all train-hetero train-homo train-xgboost compare serve mlflow-ui docker-up lint ingest ingest-full pipeline pipeline-force monitor
 
 help:
 	@echo "Electricity Price Forecasting — Developer Workflow"
@@ -8,6 +8,17 @@ help:
 	@echo "  make train-hetero     Train HeteroSAGE (quick_retrain.py)"
 	@echo "  make train-homo       Train HomoGNN GraphSAGE (homo_retrain.py)"
 	@echo "  make train-xgboost    Train XGBoost baseline (xgboost_baseline.py)"
+	@echo ""
+	@echo "Data Ingestion:"
+	@echo "  make ingest           Incremental ingest (spot prices + weather)"
+	@echo "  make ingest-full      Full-history ingest (all available data)"
+	@echo ""
+	@echo "Pipeline:"
+	@echo "  make pipeline         Run full MLOps pipeline (ingest+train+eval+register)"
+	@echo "  make pipeline-force   Run pipeline and force graph rebuild"
+	@echo ""
+	@echo "Monitoring:"
+	@echo "  make monitor          Print rolling MAE and drift report"
 	@echo ""
 	@echo "Evaluation:"
 	@echo "  make compare          Print model comparison report"
@@ -44,6 +55,21 @@ mlflow-ui:
 
 docker-up:
 	docker compose up mlflow api
+
+ingest:
+	python -c "import sys; sys.path.insert(0,'src'); from data_ingestion import run_ingestion; import json; print(json.dumps(run_ingestion(), indent=2, default=str))"
+
+ingest-full:
+	python -c "import sys; sys.path.insert(0,'src'); from data_ingestion import run_ingestion; import json; print(json.dumps(run_ingestion(full_history=True), indent=2, default=str))"
+
+pipeline:
+	python src/pipeline.py
+
+pipeline-force:
+	python src/pipeline.py --force
+
+monitor:
+	python -c "import sys; sys.path.insert(0,'src'); from monitoring import get_monitoring_report; import json; print(json.dumps(get_monitoring_report(), indent=2))"
 
 lint:
 	python -m py_compile src/*.py && echo All OK

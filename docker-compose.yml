@@ -74,3 +74,32 @@ services:
       - train-homo
     profiles:
       - train
+
+  pipeline:
+    build: .
+    volumes:
+      - ./src/data:/app/src/data
+      - ./src/artifacts:/app/src/artifacts
+      - ./src/artifacts_hetero:/app/src/artifacts_hetero
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    command: python src/pipeline.py
+    depends_on:
+      - mlflow
+    profiles:
+      - pipeline
+
+  ingest:
+    build: .
+    volumes:
+      - ./src/data:/app/src/data
+      - ./src/artifacts:/app/src/artifacts
+      - ./src/artifacts_hetero:/app/src/artifacts_hetero
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src
+    command: python src/data_ingestion.py
+    profiles:
+      - pipeline
