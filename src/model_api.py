@@ -1,9 +1,13 @@
 """
 FastAPI serving for HeteroPriceForecaster.
 
-GET  /health   → model status
-GET  /metrics  → test metrics from hetero_metrics_clean.json
-POST /predict  → single-step price forecast for DK1 or DK2
+GET  /health             -> model status
+GET  /metrics            -> test metrics from hetero_metrics_clean.json
+POST /predict            -> single-step price forecast for DK1 or DK2
+POST /pipeline/run       -> trigger the full MLOps pipeline as a background task
+GET  /pipeline/status    -> return last pipeline run status
+GET  /monitoring/report  -> return rolling MAE and drift status
+POST /monitor/log-actual -> log the actual observed price for MAE tracking
 """
 import sys
 import json
@@ -14,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -32,6 +36,9 @@ app = FastAPI(
     description="HeteroPriceForecaster (HeteroSAGE) — DK1 & DK2 zones",
     version="1.0.0",
 )
+
+# Track pipeline state between background runs
+_pipeline_status: dict = {"status": "idle"}
 
 # ---------------------------------------------------------------------------
 # Startup: load model + scalers
@@ -183,6 +190,84 @@ def predict(req: PredictRequest):
 
         return PredictResponse(zone=zone, predicted_price_dkk=predicted_dkk)
 
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Pipeline & monitoring endpoints
+# ---------------------------------------------------------------------------
+
+def _run_pipeline_task(force_rebuild: bool):
+    """Background task: run the full pipeline and update _pipeline_status."""
+    global _pipeline_status
+    _pipeline_status["status"] = "running"
+    _pipeline_status["started_at"] = __import__("datetime").datetime.utcnow().isoformat()
+    try:
+        from pipeline import run_pipeline
+        result = run_pipeline(force_rebuild_graph=force_rebuild)
+        _pipeline_status = {
+            "status": result.status,
+            "finished_at": __import__("datetime").datetime.utcnow().isoformat(),
+            "stages_completed": result.stages_completed,
+            "metrics": result.metrics,
+            "improved": result.improved,
+            "errors": result.errors,
+            "duration_seconds": result.duration_seconds,
+        }
+    except Exception as exc:
+        _pipeline_status = {
+            "status": "failed",
+            "error": str(exc),
+            "finished_at": __import__("datetime").datetime.utcnow().isoformat(),
+        }
+
+
+@app.post("/pipeline/run")
+async def trigger_pipeline(
+    background_tasks: BackgroundTasks,
+    force_rebuild: bool = False,
+):
+    """Trigger the full MLOps pipeline as a background task. Returns immediately."""
+    global _pipeline_status
+    if _pipeline_status.get("status") == "running":
+        return {"status": "already_running", "message": "Pipeline is already in progress"}
+    _pipeline_status["status"] = "running"
+    background_tasks.add_task(_run_pipeline_task, force_rebuild)
+    return {"status": "started", "message": "Pipeline running in background"}
+
+
+@app.get("/pipeline/status")
+def pipeline_status():
+    """Return last pipeline run status."""
+    try:
+        from pipeline import get_pipeline_status
+        persisted = get_pipeline_status()
+        # Merge with in-memory status (running state is only in memory)
+        if _pipeline_status.get("status") == "running":
+            return _pipeline_status
+        return persisted
+    except Exception as exc:
+        return {"status": "unknown", "error": str(exc)}
+
+
+@app.get("/monitoring/report")
+def monitoring_report():
+    """Return rolling MAE and drift status."""
+    try:
+        from monitoring import get_monitoring_report
+        return get_monitoring_report()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/monitor/log-actual")
+def log_actual_price(zone: str, timestamp: str, actual_price_dkk: float):
+    """Log the actual observed price for a previous prediction (enables MAE tracking)."""
+    try:
+        from monitoring import log_prediction
+        log_prediction(zone=zone, predicted_dkk=None, features={}, actual_dkk=actual_price_dkk)
+        return {"status": "logged", "zone": zone, "timestamp": timestamp, "actual_price_dkk": actual_price_dkk}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
