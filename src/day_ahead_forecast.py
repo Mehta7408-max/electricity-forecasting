@@ -4,9 +4,10 @@ Multi-area day-ahead forecasting analysis.
 Addresses the gaps in the original evaluation:
   1. Per-zone metrics for all four areas  (DK1, DK2, HYDRO, DE)
   2. Hourly and weekly price profiles     (avg predicted vs actual by time slot)
-  3. 24-step recursive horizon simulation (MAE vs forecast horizon)
-     — at each step the lag_1h feature is replaced with the prior prediction,
-       compounding autoregressive error across the test window.
+  3. MAE by hour-of-day position          (which delivery hours are hardest)
+     — the model is genuine day-ahead: it predicts all 24 hours of day D directly
+       from lags known at gate closure (>=24h). There is no recursive feedback,
+       so we report error per delivery hour rather than a compounding 1-step sim.
 
 Works with both legacy (9-feature) and current (13-feature) checkpoints.
 Outputs saved to artifacts_hetero/day_ahead_results.json
@@ -24,7 +25,6 @@ from hetero_models import load_hetero_model
 from hetero_pipeline import prepare_multi_area_data
 
 ZONE_NAMES = ['DK1', 'DK2', 'HYDRO', 'DE']
-LAG1_IDX = 0   # index of price_lag_1h in feature vector
 
 
 def _load():
@@ -102,53 +102,36 @@ def compute_hourly_price_profiles(model, data, num_hours, x_base):
     return profiles
 
 
-def simulate_recursive_horizon(model, data, num_hours, x_base, max_horizon=24):
+def compute_hour_position_mae(model, data, num_hours, x_base):
     """
-    Simulate autoregressive horizon degradation: at step h, the lag_1h feature
-    of each test node is replaced with the step h-1 prediction (properly re-scaled).
+    Day-ahead error by delivery hour (00:00 … 23:00).
 
-    Predictions are in raw DKK; the feature vector expects StandardScaler-normalised
-    values. We load the fitted scaler and apply the inverse/forward transform so
-    inserted lag features stay in the correct range.
+    The model emits all 24 hours of day D in a single forward pass from lags known
+    at gate closure — there is no recursive feedback to compound. The meaningful
+    horizon question is therefore: are some delivery hours (e.g. evening peak)
+    intrinsically harder to forecast than others?
 
-    Returns per-zone list of MAE for h = 1 … max_horizon.
+    Returns a per-zone list of 24 MAE values indexed by hour-of-day.
     """
-    import pickle
-    scalers_path = GRAPH_DIR / "hetero_scalers.pkl"
-    if scalers_path.exists():
-        with open(scalers_path, "rb") as f:
-            scalers = pickle.load(f)
-        feat_scaler = scalers['feature_scaler']
-        lag1_mean  = float(feat_scaler.mean_[LAG1_IDX])
-        lag1_std   = float(feat_scaler.scale_[LAG1_IDX])
-    else:
-        # Fallback: estimate from x_base feature column
-        col = x_base[:, LAG1_IDX].numpy()
-        lag1_mean, lag1_std = float(col.mean()), float(col.std() + 1e-6)
+    import pandas as pd
+    df_dk1, _, _, _, _ = prepare_multi_area_data()
+    ts = pd.to_datetime(df_dk1['timestamp'].values)
+    hour_of_day_full = ts.hour.values  # aligned to the per-zone hour index
 
-    y          = data['hour'].y.cpu().numpy()
-    tm         = data['hour'].test_mask.cpu().numpy()
-    test_start = int(num_hours * 0.9)
+    out = _infer(model, data, x_base, num_hours)
+    y   = data['hour'].y.cpu().numpy()
+    tm  = data['hour'].test_mask.cpu().numpy()
 
-    x_current  = x_base.numpy().copy()
     horizon_mae = {name: [] for name in ZONE_NAMES}
-
-    for h in range(1, max_horizon + 1):
-        out = _infer(model, data, torch.tensor(x_current, dtype=torch.float32), num_hours)
-
-        for z, name in enumerate(ZONE_NAMES):
-            sl = slice(z * num_hours, (z + 1) * num_hours)
-            zm = tm[sl]
-            horizon_mae[name].append(round(float(mean_absolute_error(y[sl][zm], out[sl][zm])), 4))
-
-        # Scale prediction back to feature space before inserting as lag_1h
-        for z in range(4):
-            off = z * num_hours
-            for t in range(test_start, num_hours - 1):
-                raw_pred = out[off + t]
-                scaled   = (raw_pred - lag1_mean) / lag1_std
-                x_current[off + t + 1, LAG1_IDX] = scaled
-
+    for z, name in enumerate(ZONE_NAMES):
+        sl  = slice(z * num_hours, (z + 1) * num_hours)
+        zm  = tm[sl]
+        y_z, p_z = y[sl][zm], out[sl][zm]
+        hod_z = hour_of_day_full[zm]
+        for h in range(24):
+            sel = hod_z == h
+            mae = float(mean_absolute_error(y_z[sel], p_z[sel])) if sel.any() else 0.0
+            horizon_mae[name].append(round(mae, 4))
     return horizon_mae
 
 
@@ -166,8 +149,8 @@ def run_day_ahead_analysis():
     print("  [2/3] Hourly and weekly price profiles...")
     profiles = compute_hourly_price_profiles(model, data, num_hours, x_base)
 
-    print("  [3/3] Recursive 24-step horizon simulation...")
-    horizon = simulate_recursive_horizon(model, data, num_hours, x_base, max_horizon=24)
+    print("  [3/3] MAE by delivery hour (day-ahead, direct 24h)...")
+    horizon = compute_hour_position_mae(model, data, num_hours, x_base)
 
     summary = {
         'per_zone_metrics': zone_metrics,
@@ -188,13 +171,11 @@ def run_day_ahead_analysis():
         flag = data_status.get(name, '?')
         print(f"  {name:<8} {m['mae']:>8.2f} {m['rmse']:>8.2f} {m['r2']:>7.4f} {m['smape']:>7.2f}%  {flag}")
 
-    print("\n⏳ Recursive Horizon — DK1 MAE (DKK) [errors compound when lag≠actual]:")
+    print("\n🕓 DK1 MAE by delivery hour (day-ahead, all 24h predicted at once):")
     dk1_h = horizon.get('DK1', [])
-    for step in [1, 2, 3, 6, 12, 18, 24]:
-        if step <= len(dk1_h):
-            v = dk1_h[step-1]
-            note = " ← stable" if step <= 3 else (" ← degrading" if v < 1000 else " ← unstable")
-            print(f"    h={step:2d}h → {v:.1f} DKK{note}")
+    for h in range(0, 24, 3):
+        if h < len(dk1_h):
+            print(f"    {h:02d}h → {dk1_h[h]:.1f} DKK")
 
     print("\n🕐 DK1 Daily Price Profile (avg by hour):")
     for h in range(0, 24, 3):

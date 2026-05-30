@@ -3,7 +3,7 @@ FastAPI serving for HeteroPriceForecaster.
 
 GET  /health             -> model status
 GET  /metrics            -> test metrics from hetero_metrics_clean.json
-POST /predict            -> single-step price forecast for DK1 or DK2
+POST /predict            -> day-ahead price forecast for DK1 or DK2
 POST /pipeline/run       -> trigger the full MLOps pipeline as a background task
 GET  /pipeline/status    -> return last pipeline run status
 GET  /monitoring/report  -> return rolling MAE and drift status
@@ -88,12 +88,16 @@ async def load_model():
 # Schema
 # ---------------------------------------------------------------------------
 class PredictRequest(BaseModel):
+    """
+    Day-ahead feature vector. All price lags are >= 24h (known at gate closure)
+    and weather is the day-ahead forecast for the target hour.
+    """
     zone: str = Field(..., description="DK1 or DK2")
-    lag_1h: float
-    lag_2h: float
-    lag_6h: float
-    rolling_6h_mean: float
-    rolling_6h_std: float
+    lag_24h: float = Field(..., description="Price same hour previous day (DKK)")
+    lag_48h: float = Field(..., description="Price same hour two days ago (DKK)")
+    lag_168h: float = Field(..., description="Price same hour previous week (DKK)")
+    rolling_24h_mean: float = Field(..., description="Mean price 24-47h before target (DKK)")
+    rolling_24h_std: float = Field(..., description="Std price 24-47h before target (DKK)")
     temperature_c: float
     wind_speed_ms: float
     cloud_cover_pct: float
@@ -136,7 +140,7 @@ def predict(req: PredictRequest):
         import torch
 
         # Build 13-feature vector (same order as hetero_graph_builder extract_features + cyclical)
-        # [lag_1h, lag_2h, lag_6h, roll_mean, roll_std, temp, wind, cloud, humidity,
+        # [lag_24h, lag_48h, lag_168h, roll24_mean, roll24_std, temp, wind, cloud, humidity,
         #  hour_sin, hour_cos, week_sin, week_cos]
         hour_sin = math.sin(2 * math.pi * req.hour_of_day / 24.0)
         hour_cos = math.cos(2 * math.pi * req.hour_of_day / 24.0)
@@ -144,11 +148,11 @@ def predict(req: PredictRequest):
         week_cos = math.cos(2 * math.pi * req.day_of_week / 7.0)
 
         raw_features = np.array([[
-            req.lag_1h,
-            req.lag_2h,
-            req.lag_6h,
-            req.rolling_6h_mean,
-            req.rolling_6h_std,
+            req.lag_24h,
+            req.lag_48h,
+            req.lag_168h,
+            req.rolling_24h_mean,
+            req.rolling_24h_std,
             req.temperature_c,
             req.wind_speed_ms,
             req.cloud_cover_pct,

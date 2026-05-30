@@ -74,17 +74,32 @@ def prepare_multi_area_data():
     return df_dk1, df_dk2, df_hydro, df_de, df_weather
 
 def _add_autoregressive_features(df):
-    """Calculates temporal lag sequences securely without backwards information leakage."""
-    df['price_lag_1h'] = df['price_dkk'].shift(1)
-    df['price_lag_2h'] = df['price_dkk'].shift(2)
-    df['price_lag_6h'] = df['price_dkk'].shift(6)
-    
-    # Rolling attributes derived securely from historical offsets
-    df['price_rolling_6h_mean'] = df['price_dkk'].shift(1).rolling(6).mean()
-    df['price_rolling_6h_std'] = df['price_dkk'].shift(1).rolling(6).std()
-    
+    """
+    Day-ahead-safe autoregressive features.
+
+    All lags are anchored at >= 24h, so every feature is known at gate closure
+    (12:00 CET on day D-1) when forecasting the 24 delivery hours of day D.
+    Nord Pool publishes the full day-D-1 price curve at noon on day D-2, so the
+    entire previous day (lag_24h) is available for all target hours — no leakage.
+
+    Replaces the previous next-hour design (shift(1)/shift(2)/shift(6)), which
+    leaked the most recent actual price and made the model a one-step-ahead
+    predictor rather than a genuine day-ahead forecaster.
+
+    Weather columns (merged upstream at the target timestamp) are kept as a
+    "perfect weather forecast" proxy — the standard EPF convention, since 12–36h
+    weather forecasts are highly accurate.
+    """
+    df['price_lag_24h']  = df['price_dkk'].shift(24)    # same hour, previous day
+    df['price_lag_48h']  = df['price_dkk'].shift(48)    # same hour, two days ago
+    df['price_lag_168h'] = df['price_dkk'].shift(168)   # same hour, previous week
+
+    # Rolling stats over the last fully-known day (24–47h ago) — leakage-free
+    df['price_rolling_24h_mean'] = df['price_dkk'].shift(24).rolling(24).mean()
+    df['price_rolling_24h_std']  = df['price_dkk'].shift(24).rolling(24).std()
+
     df['hour_of_day'] = pd.to_datetime(df['timestamp']).dt.hour
     df['minute'] = pd.to_datetime(df['timestamp']).dt.minute
-    
-    # Leakage fixed: Replace initial cold-start NaNs with 0.0 instead of backfilling future data
+
+    # Cold-start NaNs (first 168h) filled with 0.0 — never backfilled from future
     return df.fillna(0.0).reset_index(drop=True)

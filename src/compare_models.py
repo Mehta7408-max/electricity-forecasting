@@ -139,16 +139,16 @@ def load_metrics():
     else:
         print("  (run interpretability.py to generate)")
 
-    # ── Section 6: Horizon Degradation ──────────────────────────────────────
-    print("\n▶  SECTION 6: DK1 MAE vs Forecast Horizon (recursive 24-step)\n")
+    # ── Section 6: MAE by delivery hour ─────────────────────────────────────
+    print("\n▶  SECTION 6: DK1 MAE by delivery hour (day-ahead, 24h predicted at once)\n")
     if da_m:
         dk1_h = da_m.get('horizon_mae', {}).get('DK1', [])
         if dk1_h:
-            print(f"  {'Horizon':>10} {'MAE (DKK)':>12}")
+            print(f"  {'Hour':>10} {'MAE (DKK)':>12}")
             print("  " + "-" * 24)
-            for step in [1, 2, 3, 6, 9, 12, 18, 24]:
-                if step <= len(dk1_h):
-                    print(f"  h={step:2d}h       {dk1_h[step-1]:>12.2f}")
+            for h in [0, 3, 6, 9, 12, 15, 18, 21]:
+                if h < len(dk1_h):
+                    print(f"  {h:02d}h        {dk1_h[h]:>12.2f}")
         else:
             print("  (run day_ahead_forecast.py to generate)")
     else:

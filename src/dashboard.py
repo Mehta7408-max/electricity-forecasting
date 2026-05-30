@@ -249,12 +249,12 @@ def page_predict(api_up):
         c1, c2, c3 = st.columns(3)
         with c1:
             zone = st.selectbox("Zone", ["DK1", "DK2"])
-            lag_1h = st.number_input("lag_1h (DKK)", value=500.0, step=10.0)
-            lag_2h = st.number_input("lag_2h (DKK)", value=510.0, step=10.0)
-            lag_6h = st.number_input("lag_6h (DKK)", value=480.0, step=10.0)
+            lag_24h = st.number_input("lag_24h (DKK)", value=500.0, step=10.0)
+            lag_48h = st.number_input("lag_48h (DKK)", value=510.0, step=10.0)
+            lag_168h = st.number_input("lag_168h (DKK)", value=480.0, step=10.0)
         with c2:
-            rolling_6h_mean = st.number_input("rolling_6h_mean (DKK)", value=495.0, step=10.0)
-            rolling_6h_std = st.number_input("rolling_6h_std (DKK)", value=60.0, step=5.0)
+            rolling_24h_mean = st.number_input("rolling_24h_mean (DKK)", value=495.0, step=10.0)
+            rolling_24h_std = st.number_input("rolling_24h_std (DKK)", value=60.0, step=5.0)
             temperature_c = st.number_input("temperature_c (°C)", value=8.0, step=0.5)
             wind_speed_ms = st.number_input("wind_speed_ms (m/s)", value=6.0, step=0.5)
         with c3:
@@ -268,11 +268,11 @@ def page_predict(api_up):
     if submitted:
         payload = {
             "zone": zone,
-            "lag_1h": lag_1h,
-            "lag_2h": lag_2h,
-            "lag_6h": lag_6h,
-            "rolling_6h_mean": rolling_6h_mean,
-            "rolling_6h_std": rolling_6h_std,
+            "lag_24h": lag_24h,
+            "lag_48h": lag_48h,
+            "lag_168h": lag_168h,
+            "rolling_24h_mean": rolling_24h_mean,
+            "rolling_24h_std": rolling_24h_std,
             "temperature_c": temperature_c,
             "wind_speed_ms": wind_speed_ms,
             "cloud_cover_pct": cloud_cover_pct,
@@ -404,11 +404,12 @@ def page_interpretability():
         fig = go.Figure(go.Bar(x=vals, y=names, orientation="h", marker_color=HETERO_COLOR))
         fig.update_layout(
             title=f"Relative feature importance — {zone}",
-            xaxis_title="Saliency (normalised to lag_1h = 1.0)",
+            xaxis_title="Saliency (normalised to top feature = 1.0)",
             height=460,
         )
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("The most recent price lag (`lag_1h`) dominates — typical of autoregressive price series.")
+        st.caption("Day-ahead saliency: with the t-1 leakage edge removed, importance spreads across "
+                   "the 24h/168h lags, weekly seasonality, and weather rather than collapsing onto one lag.")
 
     # ---- ablation --------------------------------------------------------
     st.subheader("Ablation study — DK1 MAE by graph component removed")

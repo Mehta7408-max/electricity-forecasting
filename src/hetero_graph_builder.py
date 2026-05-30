@@ -61,8 +61,8 @@ def build_heterogeneous_spatiotemporal_graph(freeze_scaler=False):
     
     def extract_features(df):
         cols = [
-            'price_lag_1h', 'price_lag_2h', 'price_lag_6h',
-            'price_rolling_6h_mean', 'price_rolling_6h_std',
+            'price_lag_24h', 'price_lag_48h', 'price_lag_168h',
+            'price_rolling_24h_mean', 'price_rolling_24h_std',
             'temperature_c', 'wind_speed_ms', 'cloud_cover_pct', 'humidity_pct'
         ]
         # Return 0 defaults if weather variables aren't present in specific zone views
@@ -134,16 +134,22 @@ def build_heterogeneous_spatiotemporal_graph(freeze_scaler=False):
     data['hour', 'belongs_to', 'market'].edge_index = torch.tensor([belongs_src, belongs_dst], dtype=torch.long)
     data['market', 'rev_belongs_to', 'hour'].edge_index = torch.tensor([belongs_dst, belongs_src], dtype=torch.long)
     
-    # Chronological Autoregressive Lag Edges (Hour_t-1 connects to Hour_t)
-    lag_src = []
-    lag_dst = []
+    # Day-Ahead Autoregressive Lag Edges.
+    # Connect each hour to the same hour on the previous day (t-24) and the
+    # previous week (t-168) — both known at gate closure, so the temporal graph
+    # structure matches the day-ahead forecasting problem (no t-1 leakage edge).
+    DAY_AHEAD_LAGS = [24, 168]
+    lag_src_parts, lag_dst_parts = [], []
     for zone_idx in range(4):
         offset = zone_idx * num_hours
-        for t in range(1, num_hours):
-            lag_src.append(offset + (t - 1))
-            lag_dst.append(offset + t)
-            
-    data['hour', 'lag_to', 'hour'].edge_index = torch.tensor([lag_src, lag_dst], dtype=torch.long)
+        for lag in DAY_AHEAD_LAGS:
+            t = np.arange(lag, num_hours)
+            lag_src_parts.append(offset + (t - lag))
+            lag_dst_parts.append(offset + t)
+    lag_src = np.concatenate(lag_src_parts)
+    lag_dst = np.concatenate(lag_dst_parts)
+
+    data['hour', 'lag_to', 'hour'].edge_index = torch.tensor(np.stack([lag_src, lag_dst]), dtype=torch.long)
     
     # Cross-Border Spatial Grid Interconnects (Market-to-Market Topology)
     # 0: DK1, 1: DK2, 2: HYDRO, 3: DE

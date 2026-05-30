@@ -22,7 +22,7 @@ from hetero_config import DEVICE, ARTIFACTS_DIR, GRAPH_DIR
 from hetero_models import load_hetero_model
 from hetero_pipeline import prepare_multi_area_data
 
-FEATURE_NAMES_9  = ['lag_1h', 'lag_2h', 'lag_6h', 'roll_6h_mean', 'roll_6h_std',
+FEATURE_NAMES_9  = ['lag_24h', 'lag_48h', 'lag_168h', 'roll_24h_mean', 'roll_24h_std',
                     'temperature', 'wind_speed', 'cloud_cover', 'humidity']
 FEATURE_NAMES_13 = FEATURE_NAMES_9 + ['hour_sin', 'hour_cos', 'week_sin', 'week_cos']
 ZONE_NAMES = ['DK1', 'DK2', 'HYDRO', 'DE']

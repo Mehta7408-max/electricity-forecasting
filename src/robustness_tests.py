@@ -25,7 +25,7 @@ from hetero_config import DEVICE, ARTIFACTS_DIR, GRAPH_DIR
 from hetero_models import load_hetero_model
 
 ZONE_NAMES = ['DK1', 'DK2', 'HYDRO', 'DE']
-LAG_COLS = [0, 1, 2, 3, 4]   # lag_1h, lag_2h, lag_6h, roll_mean, roll_std
+LAG_COLS = [0, 1, 2, 3, 4]   # lag_24h, lag_48h, lag_168h, roll_24h_mean, roll_24h_std
 
 
 def _load():
