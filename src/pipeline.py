@@ -142,13 +142,21 @@ def run_pipeline(
 
     # ------------------------------------------------------------------
     # Stage 3 — Build graph
+    #
+    # Incremental run (new data, no --force): freeze the scaler so the feature
+    #   distribution stays fixed → the model can be warm-started safely.
+    # Full run (--force): refit the scaler and retrain from scratch.
     # ------------------------------------------------------------------
+    incremental = not force_rebuild_graph
     should_rebuild = force_rebuild_graph or new_rows_ingested > 0
     if not skip_training and should_rebuild:
         try:
             from hetero_graph_builder import build_heterogeneous_spatiotemporal_graph
-            build_heterogeneous_spatiotemporal_graph()
-            logger.info("Stage 3 [BUILD] graph rebuilt successfully")
+            build_heterogeneous_spatiotemporal_graph(freeze_scaler=incremental)
+            logger.info(
+                "Stage 3 [BUILD] graph rebuilt (%s scaler)",
+                "frozen" if incremental else "fresh",
+            )
             stages_completed.append("BUILD")
         except Exception as exc:
             msg = f"Stage 3 [BUILD] failed: {exc}"
@@ -167,8 +175,13 @@ def run_pipeline(
     if not skip_training:
         try:
             from quick_retrain import quick_retrain
-            new_metrics = quick_retrain()
-            logger.info("Stage 4 [TRAIN] complete: MAE=%.2f", new_metrics.get("mae", float("inf")))
+            # Warm-start fine-tune for incremental runs; full fresh train on --force.
+            new_metrics = quick_retrain(warm_start=incremental)
+            logger.info(
+                "Stage 4 [TRAIN] complete (%s): MAE=%.2f",
+                "warm-start" if incremental else "fresh",
+                new_metrics.get("mae", float("inf")),
+            )
             stages_completed.append("TRAIN")
         except Exception as exc:
             msg = f"Stage 4 [TRAIN] failed: {exc}"

@@ -1,11 +1,12 @@
-.PHONY: help train-all train-hetero train-homo train-xgboost compare serve mlflow-ui docker-up lint ingest ingest-full pipeline pipeline-force monitor
+.PHONY: help train-all train-hetero train-hetero-warm train-homo train-xgboost compare serve mlflow-ui docker-up lint ingest ingest-full pipeline pipeline-force monitor
 
 help:
 	@echo "Electricity Price Forecasting — Developer Workflow"
 	@echo ""
 	@echo "Training:"
 	@echo "  make train-all        Train all three models"
-	@echo "  make train-hetero     Train HeteroSAGE (quick_retrain.py)"
+	@echo "  make train-hetero     Train HeteroSAGE from scratch (quick_retrain.py)"
+	@echo "  make train-hetero-warm Fine-tune HeteroSAGE from existing weights (fast)"
 	@echo "  make train-homo       Train HomoGNN GraphSAGE (homo_retrain.py)"
 	@echo "  make train-xgboost    Train XGBoost baseline (xgboost_baseline.py)"
 	@echo ""
@@ -14,8 +15,8 @@ help:
 	@echo "  make ingest-full      Full-history ingest (all available data)"
 	@echo ""
 	@echo "Pipeline:"
-	@echo "  make pipeline         Run full MLOps pipeline (ingest+train+eval+register)"
-	@echo "  make pipeline-force   Run pipeline and force graph rebuild"
+	@echo "  make pipeline         Incremental run (frozen scaler + warm-start fine-tune)"
+	@echo "  make pipeline-force   Full rebuild + from-scratch retrain (fresh scaler)"
 	@echo ""
 	@echo "Monitoring:"
 	@echo "  make monitor          Print rolling MAE and drift report"
@@ -37,6 +38,9 @@ train-all: train-xgboost train-homo train-hetero compare
 
 train-hetero:
 	PYTHONPATH=src python src/quick_retrain.py
+
+train-hetero-warm:
+	PYTHONPATH=src python src/quick_retrain.py --warm-start
 
 train-homo:
 	PYTHONPATH=src python src/homo_retrain.py

@@ -16,15 +16,47 @@ from hetero_models import HeteroPriceForecaster
 from mlflow_config import setup_mlflow
 
 
-def quick_retrain(hidden_channels=64, max_epochs=120, patience=20):
-    print("\n⚡ Quick retrain — HeteroPriceForecaster")
+def quick_retrain(hidden_channels=64, max_epochs=120, patience=20, warm_start=False):
+    """
+    Train HeteroPriceForecaster on the current graph.
+
+    warm_start:
+        False (default) — fresh random weights, full LR (0.002), full epoch
+            budget. Use for a from-scratch retrain (e.g. after a full graph
+            rebuild with a refit scaler).
+        True — load existing best_hetero_model.pt weights and fine-tune with a
+            gentler LR (5e-4) and a shorter epoch budget. Much faster / cheaper
+            for incremental updates when new data arrives. Requires the saved
+            checkpoint to match the current feature dimensionality and uses the
+            checkpoint's hidden_channels automatically. Falls back to a fresh
+            train if no checkpoint exists.
+    """
+    print("\n⚡ Quick retrain — HeteroPriceForecaster" + ("  (warm-start)" if warm_start else ""))
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    ckpt_path = ARTIFACTS_DIR / "best_hetero_model.pt"
+
+    # ── Decide warm-start vs fresh + derive matching hyperparameters ───────────
+    do_warm = warm_start and ckpt_path.exists()
+    if warm_start and not ckpt_path.exists():
+        print("   ⚠️  warm_start requested but no checkpoint found — training fresh.")
+
+    if do_warm:
+        # Read hidden_channels straight from the checkpoint so architecture matches.
+        _ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+        hidden_channels = _ckpt['market_lin.weight'].shape[0]
+        lr = 5e-4                              # gentle fine-tune LR
+        max_epochs = min(max_epochs, 40)       # short budget for warm-start
+        patience = min(patience, 10)
+    else:
+        _ckpt = None
+        lr = 0.002
 
     # ── MLflow setup ───────────────────────────────────────────────────────────
     try:
         setup_mlflow()
         import mlflow
-        _mlflow_run = mlflow.start_run(run_name="HeteroSAGE")
+        _mlflow_run = mlflow.start_run(run_name="HeteroSAGE-warmstart" if do_warm else "HeteroSAGE")
         _mlflow_ok = True
     except Exception as _e:
         print(f"   [MLflow] Disabled — {_e}")
@@ -38,8 +70,9 @@ def quick_retrain(hidden_channels=64, max_epochs=120, patience=20):
                     "hidden_channels": hidden_channels,
                     "max_epochs": max_epochs,
                     "patience": patience,
-                    "lr": 0.002,
+                    "lr": lr,
                     "weight_decay": 1e-4,
+                    "warm_start": do_warm,
                 })
             except Exception:
                 pass
@@ -53,10 +86,20 @@ def quick_retrain(hidden_channels=64, max_epochs=120, patience=20):
             hidden_channels=hidden_channels,
         ).to(DEVICE)
 
+        # ── Warm-start: load existing weights before training ──────────────────
+        if do_warm:
+            try:
+                model.load_state_dict(_ckpt)
+                print(f"   🔁 Warm-start — loaded existing weights, fine-tuning at lr={lr}")
+            except Exception as _e:
+                print(f"   ⚠️  Could not load checkpoint for warm-start ({_e}) — training fresh.")
+                do_warm = False
+                lr = 0.002
+
         params = sum(p.numel() for p in model.parameters())
         print(f"   Params: {params:,} | hidden_channels={hidden_channels} | {num_hours} hours/zone")
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=8
         )
@@ -69,7 +112,6 @@ def quick_retrain(hidden_channels=64, max_epochs=120, patience=20):
         vl_mask = data['hour'].val_mask.to(DEVICE)
         te_mask = data['hour'].test_mask.to(DEVICE)
 
-        ckpt_path = ARTIFACTS_DIR / "best_hetero_model.pt"
         best_val  = float('inf')
         patience_ctr = 0
         t0 = time.time()
@@ -164,4 +206,5 @@ def quick_retrain(hidden_channels=64, max_epochs=120, patience=20):
 
 
 if __name__ == "__main__":
-    quick_retrain()
+    warm = "--warm-start" in sys.argv
+    quick_retrain(warm_start=warm)

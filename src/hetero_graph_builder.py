@@ -3,6 +3,7 @@
 Advanced Graph Builder for Heterogeneous Multi-Area Electricity Forecasting.
 Implements Cyclical Calendar Profiles and Weighted Spatial Interconnect Features.
 """
+import sys
 import torch
 import pandas as pd
 import numpy as np
@@ -15,7 +16,19 @@ from torch_geometric.data import HeteroData
 from hetero_config import GRAPH_DIR
 from hetero_pipeline import prepare_multi_area_data 
 
-def build_heterogeneous_spatiotemporal_graph():
+def build_heterogeneous_spatiotemporal_graph(freeze_scaler=False):
+    """
+    Build the heterogeneous market graph.
+
+    freeze_scaler:
+        False (default) — fit fresh StandardScalers on the current training
+            partition. Use for a full retrain from scratch.
+        True — reuse the previously saved feature/target scalers from
+            hetero_scalers.pkl instead of refitting. This keeps the input
+            feature distribution fixed across incremental graph rebuilds so
+            that warm-started model weights remain valid. Falls back to
+            fitting fresh scalers if no saved pickle exists.
+    """
     print("\n🏗️ Building Context-Aware Heterogeneous Market Graph...")
     GRAPH_DIR.mkdir(parents=True, exist_ok=True)
     
@@ -72,12 +85,24 @@ def build_heterogeneous_spatiotemporal_graph():
 
     # 4. Fit Scalers sequentially to avoid cross-boundary distribution contamination
     train_idx_limit = int(num_hours * 0.8)
-    
-    feature_scaler = StandardScaler()
-    feature_scaler.fit(np.vstack([x_dk1[:train_idx_limit], x_dk2[:train_idx_limit], x_de[:train_idx_limit], x_hydro[:train_idx_limit]]))
-    
-    target_scaler = StandardScaler()
-    target_scaler.fit(np.hstack([y_dk1[:train_idx_limit], y_dk2[:train_idx_limit]]).reshape(-1, 1))
+
+    scalers_path = GRAPH_DIR / "hetero_scalers.pkl"
+    if freeze_scaler and scalers_path.exists():
+        # Reuse previously fitted scalers so the feature distribution stays
+        # fixed — required for stable warm-start fine-tuning on new data.
+        with open(scalers_path, "rb") as f:
+            _saved = pickle.load(f)
+        feature_scaler = _saved['feature_scaler']
+        target_scaler = _saved['target_scaler']
+        print("   🔒 Frozen scaler mode — reusing saved feature/target scalers.")
+    else:
+        if freeze_scaler:
+            print("   ⚠️  freeze_scaler requested but no saved scaler found — fitting fresh.")
+        feature_scaler = StandardScaler()
+        feature_scaler.fit(np.vstack([x_dk1[:train_idx_limit], x_dk2[:train_idx_limit], x_de[:train_idx_limit], x_hydro[:train_idx_limit]]))
+
+        target_scaler = StandardScaler()
+        target_scaler.fit(np.hstack([y_dk1[:train_idx_limit], y_dk2[:train_idx_limit]]).reshape(-1, 1))
     
     # 5. Build PyTorch Geometric HeteroData Object
     data = HeteroData()
@@ -159,4 +184,5 @@ def build_heterogeneous_spatiotemporal_graph():
     print(f"✅ Success! HeteroData artifact package compiled. Graph nodes: {data['hour'].x.shape[0]} entities.")
 
 if __name__ == "__main__":
-    build_heterogeneous_spatiotemporal_graph()
+    freeze = "--freeze-scaler" in sys.argv
+    build_heterogeneous_spatiotemporal_graph(freeze_scaler=freeze)
