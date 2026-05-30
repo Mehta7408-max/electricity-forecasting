@@ -1,0 +1,98 @@
+name: Retrain Models
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Which model to train"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - xgboost
+          - homo
+          - hetero
+      max_epochs:
+        description: "Maximum training epochs (GNN models)"
+        required: false
+        default: "200"
+        type: string
+
+  schedule:
+    # Every Monday at 02:00 UTC
+    - cron: "0 2 * * 1"
+
+jobs:
+  retrain:
+    name: Train ${{ github.event.inputs.model || 'all' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Train XGBoost
+        if: ${{ github.event.inputs.model == 'xgboost' || github.event.inputs.model == 'all' || github.event_name == 'schedule' }}
+        env:
+          PYTHONPATH: src
+        run: python src/xgboost_baseline.py
+
+      - name: Train HomoGNN (GraphSAGE)
+        if: ${{ github.event.inputs.model == 'homo' || github.event.inputs.model == 'all' || github.event_name == 'schedule' }}
+        env:
+          PYTHONPATH: src
+        run: |
+          python - <<EOF
+          import sys
+          sys.path.insert(0, 'src')
+          from homo_retrain import homo_retrain
+          max_epochs = int("${{ github.event.inputs.max_epochs || '200' }}")
+          homo_retrain(max_epochs=max_epochs)
+          EOF
+
+      - name: Train HeteroSAGE
+        if: ${{ github.event.inputs.model == 'hetero' || github.event.inputs.model == 'all' || github.event_name == 'schedule' }}
+        env:
+          PYTHONPATH: src
+        run: |
+          python - <<EOF
+          import sys
+          sys.path.insert(0, 'src')
+          from quick_retrain import quick_retrain
+          max_epochs = int("${{ github.event.inputs.max_epochs || '200' }}")
+          quick_retrain(max_epochs=max_epochs)
+          EOF
+
+      - name: Compare models
+        env:
+          PYTHONPATH: src
+        run: python src/compare_models.py
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts-${{ github.run_id }}
+          path: |
+            artifacts/
+            src/artifacts/
+            src/artifacts_hetero/
+          retention-days: 30
+
+      - name: Upload MLflow database
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlruns-db-${{ github.run_id }}
+          path: mlruns.db
+          retention-days: 30
