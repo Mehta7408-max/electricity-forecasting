@@ -1,4 +1,4 @@
-.PHONY: help train-all train-hetero train-hetero-warm train-homo train-xgboost compare serve mlflow-ui docker-up lint ingest ingest-full pipeline pipeline-force monitor
+.PHONY: help train-all train-hetero train-hetero-warm train-homo train-xgboost compare serve dashboard mlflow-ui docker-up lint ingest ingest-full pipeline pipeline-force monitor
 
 help:
 	@echo "Electricity Price Forecasting — Developer Workflow"
@@ -26,6 +26,7 @@ help:
 	@echo ""
 	@echo "Serving:"
 	@echo "  make serve            Start FastAPI server on :8000"
+	@echo "  make dashboard        Start Streamlit dashboard on :8501"
 	@echo "  make mlflow-ui        Start MLflow UI on :5000"
 	@echo ""
 	@echo "Docker:"
@@ -53,6 +54,9 @@ compare:
 
 serve:
 	python -m uvicorn src.model_api:app --host 0.0.0.0 --port 8000 --reload
+
+dashboard:
+	streamlit run src/dashboard.py --server.port=8501
 
 mlflow-ui:
 	mlflow ui --backend-store-uri sqlite:///mlruns.db --host 0.0.0.0 --port 5000
