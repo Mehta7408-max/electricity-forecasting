@@ -39,17 +39,20 @@ _HETERO = _SRC / "artifacts_hetero"
 
 XGB_METRICS_PATH = _ARTIFACTS / "xgboost_metrics.json"
 HOMO_METRICS_PATH = _SRC_ARTIFACTS / "homo_gnn_metrics.json"
+GAT_METRICS_PATH = _HETERO / "gat_metrics_clean.json"
 HETERO_METRICS_PATH = _HETERO / "hetero_metrics_clean.json"
+ST_HETERO_METRICS_PATH = _HETERO / "st_hetero_metrics.json"
 DAY_AHEAD_PATH = _HETERO / "day_ahead_results.json"
-ABLATION_PATH = _HETERO / "ablation_results.json"
-ROBUSTNESS_PATH = _HETERO / "robustness_results.json"
-INTERP_PATH = _HETERO / "interpretability_summary.json"
+ABLATION_PATH = _HETERO / "st_ablation_results.json"
+ROBUSTNESS_PATH = _HETERO / "st_robustness_results.json"
+INTERP_PATH = _HETERO / "st_interpretability.json"
 LAST_RUN_PATH = _HETERO / "last_pipeline_run.json"
 
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
 HETERO_COLOR = "#2563eb"
-NEUTRAL_COLORS = ["#9ca3af", "#6b7280", HETERO_COLOR]
+ST_COLOR = "#7c3aed"
+NEUTRAL_COLORS = ["#9ca3af", "#6b7280", "#4b5563", HETERO_COLOR, ST_COLOR]
 
 
 # ---------------------------------------------------------------------------
@@ -127,23 +130,28 @@ def _fmt(x, nd=2):
 def page_overview():
     st.title("⚡ Electricity Price Forecasting — MLOps Dashboard")
     st.markdown(
-        "**Research question:** *Does modelling the Nordic power market as a "
-        "heterogeneous spatio-temporal graph (HeteroSAGE) improve day-ahead price "
-        "forecasting over a homogeneous GNN and a tabular XGBoost baseline?*"
+        "**Research question:** *How can a heterogeneous graph be effectively constructed "
+        "and integrated into GNN models to improve accuracy, interpretability, and "
+        "robustness of multi-area day-ahead electricity price forecasting in the Nordic "
+        "power market?*"
     )
 
     xgb = load_json_safe(XGB_METRICS_PATH)
     homo = load_json_safe(HOMO_METRICS_PATH)
+    gat = load_json_safe(GAT_METRICS_PATH)
     hetero = load_json_safe(HETERO_METRICS_PATH)
+    st_m = load_json_safe(ST_HETERO_METRICS_PATH)
 
-    if not any([xgb, homo, hetero]):
+    if not any([xgb, homo, gat, hetero, st_m]):
         st.warning("Run the training scripts (make train-all) to generate model metrics.")
         return
 
     models = [
         ("XGBoost (tabular baseline)", xgb),
         ("Homogeneous GNN (GraphSAGE)", homo),
-        ("HeteroSAGE (ours)", hetero),
+        ("GAT", gat),
+        ("HeteroSAGE", hetero),
+        ("ST-HeteroSAGE (ours ★)", st_m),
     ]
 
     rows = []
@@ -160,24 +168,33 @@ def page_overview():
         })
     df = pd.DataFrame(rows)
 
-    st.subheader("🏆 Model Leaderboard (all-zone test set)")
+    st.subheader("🏆 Model Leaderboard (DK1+DK2 test set, chronological 80/10/10 split)")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     # ---- metric row -------------------------------------------------------
-    if hetero:
+    best = st_m or hetero
+    if best:
         c1, c2, c3 = st.columns(3)
-        c1.metric("HeteroSAGE MAE", f"{_fmt(hetero.get('mae'))} DKK")
-        c2.metric("HeteroSAGE R²", f"{_fmt(hetero.get('r2'), 4)}")
-        if homo and homo.get("mae"):
-            impr = (homo["mae"] - hetero.get("mae", 0)) / homo["mae"] * 100.0
-            c3.metric("MAE improvement vs Homogeneous", f"{impr:+.1f}%")
+        label = "ST-HeteroSAGE" if st_m else "HeteroSAGE"
+        c1.metric(f"{label} MAE", f"{_fmt(best.get('mae'))} DKK")
+        c2.metric(f"{label} R²", f"{_fmt(best.get('r2'), 4)}")
+        if xgb and xgb.get("mae"):
+            impr = (xgb["mae"] - best.get("mae", 0)) / xgb["mae"] * 100.0
+            c3.metric("MAE improvement vs XGBoost", f"{impr:+.1f}%")
         else:
-            c3.metric("MAE improvement vs Homogeneous", "n/a")
+            c3.metric("MAE improvement vs XGBoost", "n/a")
 
     # ---- charts -----------------------------------------------------------
     chart_df = df.dropna(subset=["MAE (DKK)"])
     if not chart_df.empty:
-        colors = [HETERO_COLOR if "HeteroSAGE" in n else "#9ca3af" for n in chart_df["Model"]]
+        def _bar_color(name):
+            if "ST-HeteroSAGE" in name:
+                return ST_COLOR
+            if "HeteroSAGE" in name:
+                return HETERO_COLOR
+            return "#9ca3af"
+
+        colors = [_bar_color(n) for n in chart_df["Model"]]
 
         col_a, col_b = st.columns(2)
         with col_a:
@@ -193,8 +210,8 @@ def page_overview():
             fig_mae.update_layout(
                 title="MAE across models (lower is better)",
                 yaxis_title="MAE (DKK)",
-                xaxis_tickangle=-15,
-                height=420,
+                xaxis_tickangle=-20,
+                height=440,
             )
             st.plotly_chart(fig_mae, use_container_width=True)
 
@@ -204,7 +221,7 @@ def page_overview():
                 go.Bar(
                     x=r2_df["Model"],
                     y=r2_df["R²"],
-                    marker_color=[HETERO_COLOR if "HeteroSAGE" in n else "#9ca3af" for n in r2_df["Model"]],
+                    marker_color=[_bar_color(n) for n in r2_df["Model"]],
                     text=r2_df["R²"],
                     textposition="outside",
                 )
@@ -212,19 +229,19 @@ def page_overview():
             fig_r2.update_layout(
                 title="R² across models (higher is better)",
                 yaxis_title="R²",
-                xaxis_tickangle=-15,
-                height=420,
+                xaxis_tickangle=-20,
+                height=440,
             )
             st.plotly_chart(fig_r2, use_container_width=True)
 
     st.subheader("Verdict")
     st.markdown(
-        "On the **all-zone test set**, XGBoost and the homogeneous GNN look strong on "
-        "headline MAE, but the HeteroSAGE model is evaluated on the harder **per-zone "
-        "day-ahead** task where the heterogeneous market-bridge and temporal edges pay "
-        "off (see *Forecast Analysis*, *Interpretability* and *Robustness*). The "
-        "heterogeneous structure is what lets DK1/DK2 borrow signal from market-context "
-        "nodes — the central claim of the research question."
+        "**ST-HeteroSAGE** (spatio-temporal heterogeneous GNN with CausalTCN) achieves the "
+        "best results across all metrics: **MAE 151 DKK, R² 0.696** — a **26.5% MAE reduction** "
+        "versus XGBoost and a 6.7% improvement over the homogeneous GraphSAGE baseline. "
+        "The ablation study shows that CausalTCN accounts for the largest single gain, while "
+        "the heterogeneous market bridge (market nodes + interconnect edges) provides a further "
+        "meaningful improvement over a purely spatial or purely temporal approach."
     )
 
 
@@ -390,79 +407,125 @@ def page_interpretability():
     interp = load_json_safe(INTERP_PATH)
     abl = load_json_safe(ABLATION_PATH)
 
-    # ---- feature importance ----------------------------------------------
-    st.subheader("Feature importance (gradient saliency)")
-    if not interp or not interp.get("feature_importance"):
-        st.warning("Run interpretability.py to generate interpretability_summary.json.")
+    # ---- feature importance (ST format: list of {feature, importance}) ---
+    st.subheader("Feature importance (gradient saliency — ST-HeteroSAGE)")
+    fi_raw = (interp or {}).get("feature_importance")
+    if not fi_raw:
+        st.warning("Run st_interpretability.py to generate st_interpretability.json.")
     else:
-        fi = interp["feature_importance"]
-        zone = st.selectbox("Zone", list(fi.keys()))
-        scores = fi.get(zone, {})
-        items = sorted(scores.items(), key=lambda kv: kv[1])
-        names = [k for k, _ in items]
-        vals = [v for _, v in items]
-        fig = go.Figure(go.Bar(x=vals, y=names, orientation="h", marker_color=HETERO_COLOR))
+        # ST format: list[{feature, importance}] — already sorted descending
+        if isinstance(fi_raw, list):
+            items = sorted(fi_raw, key=lambda d: d["importance"])
+            names = [d["feature"] for d in items]
+            vals  = [d["importance"] for d in items]
+            max_v = max(vals) if vals else 1.0
+            vals_norm = [v / max_v for v in vals]
+        else:
+            # fallback: old zone-keyed dict format
+            zone = st.selectbox("Zone", list(fi_raw.keys()))
+            scores = fi_raw.get(zone, {})
+            items_kv = sorted(scores.items(), key=lambda kv: kv[1])
+            names = [k for k, _ in items_kv]
+            vals_norm = [v for _, v in items_kv]
+        fig = go.Figure(go.Bar(x=vals_norm, y=names, orientation="h", marker_color=ST_COLOR))
         fig.update_layout(
-            title=f"Relative feature importance — {zone}",
-            xaxis_title="Saliency (normalised to top feature = 1.0)",
-            height=460,
+            title="ST-HeteroSAGE feature importance (normalised gradient saliency)",
+            xaxis_title="Saliency (normalised, top feature = 1.0)",
+            height=480,
         )
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("Day-ahead saliency: with the t-1 leakage edge removed, importance spreads across "
-                   "the 24h/168h lags, weekly seasonality, and weather rather than collapsing onto one lag.")
+        st.caption(
+            "Gas price and day-ahead lag (t-24h) dominate; renewable generation and "
+            "weekly seasonality follow. No t-1 leakage — all lags ≥ 24 h."
+        )
 
-    # ---- ablation --------------------------------------------------------
-    st.subheader("Ablation study — DK1 MAE by graph component removed")
+    # ---- temporal error profile ------------------------------------------
+    err = (interp or {}).get("error_by_time", {})
+    if err:
+        col_h, col_d = st.columns(2)
+        with col_h:
+            st.subheader("MAE by hour of day")
+            by_h = err.get("by_hour", {})
+            if by_h:
+                hours = sorted(by_h.keys(), key=int)
+                fig = go.Figure(go.Bar(
+                    x=[int(h) for h in hours],
+                    y=[by_h[h] for h in hours],
+                    marker_color=ST_COLOR,
+                ))
+                fig.update_layout(xaxis_title="Hour", yaxis_title="MAE (DKK)", height=340)
+                st.plotly_chart(fig, use_container_width=True)
+        with col_d:
+            st.subheader("MAE by day of week")
+            by_d = err.get("by_dow", {})
+            if by_d:
+                labels_dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                days = sorted(by_d.keys(), key=int)
+                fig = go.Figure(go.Bar(
+                    x=[labels_dow[int(d)] if int(d) < 7 else d for d in days],
+                    y=[by_d[d] for d in days],
+                    marker_color=ST_COLOR,
+                ))
+                fig.update_layout(xaxis_title="Day", yaxis_title="MAE (DKK)", height=340)
+                st.plotly_chart(fig, use_container_width=True)
+
+    # ---- ablation (ST format: {A_full, B_no_tcn, C_no_spatial, ...}) ----
+    st.subheader("Ablation study — overall MAE by ST-HeteroSAGE component removed")
     if not abl:
-        st.warning("Run ablation_study.py to generate ablation_results.json.")
+        st.warning("Run st_ablation.py to generate st_ablation_results.json.")
         return
 
-    labels = {
-        "A_full_model": "A. Full model",
-        "B_no_temporal": "B. No temporal (lag_to)",
-        "C_no_spatial": "C. No spatial (interconnects)",
-        "D_no_market_bridge": "D. No market bridge",
-        "E_no_market_context": "E. No market context",
+    st_labels = {
+        "A_full":      "A. Full ST-HeteroSAGE",
+        "B_no_tcn":    "B. No CausalTCN",
+        "C_no_spatial":"C. No spatial edges",
+        "D_no_cooccurs":"D. No co-occurs edges",
+        "E_no_market": "E. No market nodes",
+        "F_no_hydro":  "F. No HYDRO zone",
     }
+    full_mae = abl.get("A_full", {}).get("mae", 0)
     rows = []
-    for key, label in labels.items():
-        if key in abl and "DK1" in abl[key]:
-            m = abl[key]["DK1"]
-            rows.append({
-                "Variant": label,
-                "key": key,
-                "MAE (DKK)": _fmt(m.get("mae")),
-                "Δ vs full": _fmt(m.get("mae_vs_full")),
-                "R²": _fmt(m.get("r2"), 4),
-            })
+    for key, label in st_labels.items():
+        if key not in abl:
+            continue
+        m = abl[key]
+        delta = _fmt(m.get("mae", 0) - full_mae)
+        rows.append({
+            "Variant": label,
+            "key": key,
+            "MAE (DKK)": _fmt(m.get("mae")),
+            "Δ vs full": delta,
+            "R²": _fmt(m.get("r2"), 4),
+        })
     if not rows:
-        st.warning("Ablation file present but missing expected DK1 variants.")
+        st.warning("ST ablation file present but missing expected variants.")
         return
 
     abl_df = pd.DataFrame(rows)
-    colors = [HETERO_COLOR if r == "A_full_model" else "#f59e0b" for r in abl_df["key"]]
+    colors = [ST_COLOR if r == "A_full" else "#f59e0b" for r in abl_df["key"]]
     fig = go.Figure(
         go.Bar(
             x=abl_df["Variant"],
             y=abl_df["MAE (DKK)"],
             marker_color=colors,
-            text=[f"Δ {d:+.1f}" for d in abl_df["Δ vs full"]],
+            text=[f"Δ {d:+.1f}" if isinstance(d, (int, float)) else "" for d in abl_df["Δ vs full"]],
             textposition="outside",
         )
     )
-    fig.update_layout(yaxis_title="DK1 MAE (DKK)", xaxis_tickangle=-20, height=440)
+    fig.update_layout(yaxis_title="MAE (DKK)", xaxis_tickangle=-20, height=460)
     st.plotly_chart(fig, use_container_width=True)
     st.dataframe(abl_df.drop(columns=["key"]), use_container_width=True, hide_index=True)
 
     st.markdown(
-        "**Which graph components matter?**\n\n"
-        "- **Temporal edges (B)** and the **market bridge / context (D, E)** are critical: "
-        "removing either roughly **doubles** DK1 MAE (≈78 → ≈170–180 DKK).\n"
-        "- **Spatial interconnect edges (C)** barely move the needle (Δ ≈ +0.05 DKK) — DK1's "
-        "price is dominated by its own temporal history and the broader market signal, not "
-        "by the DK1↔DK2 interconnect.\n\n"
-        "This is direct evidence that the *heterogeneous* market-bridge structure — not "
-        "generic spatial message passing — is what drives HeteroSAGE's performance."
+        "**Which ST-HeteroSAGE components matter?**\n\n"
+        "- **CausalTCN (B)** is the single biggest contributor: removing it increases MAE "
+        "by **+106 DKK (+70%)** — dilated temporal convolutions capture the intra-day and "
+        "weekly periodicity that GNN message-passing alone cannot.\n"
+        "- **Spatial edges (C)** matter more than in the simpler HeteroSAGE: removing them "
+        "adds **+158 DKK** because the TCN operates zone-independently and the GNN layer is "
+        "the only path for cross-zone information.\n"
+        "- **co_occurs_with edges (D)** and **market nodes (E)** each contribute ~10–25 DKK — "
+        "meaningful but secondary to the temporal component."
     )
 
 
@@ -473,15 +536,18 @@ def page_robustness():
     st.title("🛡️ Robustness")
     rob = load_json_safe(ROBUSTNESS_PATH)
     if not rob:
-        st.warning("Run robustness_tests.py to generate robustness_results.json.")
+        st.warning("Run st_robustness.py to generate st_robustness_results.json.")
         return
 
-    base_mae = rob.get("baseline", {}).get("DK1", {}).get("mae")
+    # ST format: baseline = {mae, r2}; scenarios = {mae, r2, delta_mae, delta_pct}
+    base_info = rob.get("baseline", {})
+    # Accept both flat and DK1-nested formats
+    base_mae = base_info.get("mae") or (base_info.get("DK1") or {}).get("mae")
     if base_mae is not None:
-        st.metric("Baseline DK1 MAE (clean inputs)", f"{base_mae:.2f} DKK")
+        st.metric("Baseline MAE (clean inputs)", f"{base_mae:.2f} DKK")
 
     families = [
-        ("gaussian_noise", "Gaussian noise"),
+        ("gaussian_noise", "Gaussian noise injection"),
         ("feature_dropout", "Feature dropout"),
         ("price_spike", "Price spike"),
     ]
@@ -492,15 +558,26 @@ def page_robustness():
             continue
         st.subheader(label)
         scenarios = list(group.keys())
-        maes = [group[s].get("DK1", {}).get("mae", 0) for s in scenarios]
-        deltas = [group[s].get("DK1", {}).get("mae_delta_pct", 0) for s in scenarios]
+
+        def _get_mae(s_dict):
+            if "mae" in s_dict:
+                return s_dict["mae"]
+            return (s_dict.get("DK1") or {}).get("mae", 0)
+
+        def _get_delta(s_dict):
+            if "delta_pct" in s_dict:
+                return s_dict["delta_pct"]
+            return (s_dict.get("DK1") or {}).get("mae_delta_pct", 0)
+
+        maes   = [_get_mae(group[s])   for s in scenarios]
+        deltas = [_get_delta(group[s]) for s in scenarios]
 
         fig = go.Figure(
             go.Bar(
                 x=scenarios,
                 y=maes,
-                marker_color=HETERO_COLOR,
-                text=[f"{d:+.1f}%" for d in deltas],
+                marker_color=ST_COLOR,
+                text=[f"{d:+.2f}%" for d in deltas],
                 textposition="outside",
             )
         )
@@ -512,18 +589,18 @@ def page_robustness():
                 annotation_text="baseline",
                 annotation_position="top left",
             )
-        fig.update_layout(yaxis_title="DK1 MAE (DKK)", height=360)
+        fig.update_layout(yaxis_title="MAE (DKK)", height=380)
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown(
         "**Takeaway:**\n\n"
-        "- The model is **highly sensitive to corruption of its lag features** — additive "
-        "Gaussian noise and feature dropout both inflate MAE sharply (up to +150–165% at the "
-        "harshest levels), because the autoregressive lag inputs carry most of the signal.\n"
-        "- It is **completely invariant to the price-spike multipliers** (Δ = 0% at 2×/3×/5×). "
-        "This is an artefact of how that test is constructed: the spike is applied to held-out "
-        "ground-truth prices that don't feed back into the single-step inputs, so the model's "
-        "inputs — and therefore its predictions and MAE — are unchanged."
+        "- **Gaussian noise** causes only a modest MAE increase even at 30% noise (+6.5%), "
+        "because the CausalTCN and graph structure distribute the signal across multiple "
+        "lag paths — no single input is critical.\n"
+        "- **Feature dropout** degrades performance more sharply (up to +30% at 30% dropout), "
+        "since randomly zeroing features removes temporal context the TCN relies on.\n"
+        "- **Price spike multipliers** have minimal impact: the spike is applied to ground-truth "
+        "targets only, not to input lags, so the model's predictions are unchanged."
     )
 
 

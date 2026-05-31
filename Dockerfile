@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY src/ /app/src/
-COPY *.py /app/ 2>/dev/null || true
+COPY *.py /app/
 
 # Create necessary directories
 RUN mkdir -p /app/src/data/graphs \
