@@ -3,6 +3,7 @@
 Advanced Graph Builder for Heterogeneous Multi-Area Electricity Forecasting.
 Implements Cyclical Calendar Profiles and Weighted Spatial Interconnect Features.
 """
+import sys
 import torch
 import pandas as pd
 import numpy as np
@@ -15,7 +16,19 @@ from torch_geometric.data import HeteroData
 from hetero_config import GRAPH_DIR
 from hetero_pipeline import prepare_multi_area_data 
 
-def build_heterogeneous_spatiotemporal_graph():
+def build_heterogeneous_spatiotemporal_graph(freeze_scaler=False):
+    """
+    Build the heterogeneous market graph.
+
+    freeze_scaler:
+        False (default) — fit fresh StandardScalers on the current training
+            partition. Use for a full retrain from scratch.
+        True — reuse the previously saved feature/target scalers from
+            hetero_scalers.pkl instead of refitting. This keeps the input
+            feature distribution fixed across incremental graph rebuilds so
+            that warm-started model weights remain valid. Falls back to
+            fitting fresh scalers if no saved pickle exists.
+    """
     print("\n🏗️ Building Context-Aware Heterogeneous Market Graph...")
     GRAPH_DIR.mkdir(parents=True, exist_ok=True)
     
@@ -48,9 +61,10 @@ def build_heterogeneous_spatiotemporal_graph():
     
     def extract_features(df):
         cols = [
-            'price_lag_1h', 'price_lag_2h', 'price_lag_6h',
-            'price_rolling_6h_mean', 'price_rolling_6h_std',
-            'temperature_c', 'wind_speed_ms', 'cloud_cover_pct', 'humidity_pct'
+            'price_lag_24h', 'price_lag_48h', 'price_lag_168h',
+            'price_rolling_24h_mean', 'price_rolling_24h_std',
+            'temperature_c', 'wind_speed_ms', 'cloud_cover_pct', 'humidity_pct',
+            'load_mwh', 'renewable_mwh', 'gas_dkk', 'co2_dkk'
         ]
         # Return 0 defaults if weather variables aren't present in specific zone views
         for c in cols:
@@ -72,12 +86,27 @@ def build_heterogeneous_spatiotemporal_graph():
 
     # 4. Fit Scalers sequentially to avoid cross-boundary distribution contamination
     train_idx_limit = int(num_hours * 0.8)
-    
-    feature_scaler = StandardScaler()
-    feature_scaler.fit(np.vstack([x_dk1[:train_idx_limit], x_dk2[:train_idx_limit], x_de[:train_idx_limit], x_hydro[:train_idx_limit]]))
-    
-    target_scaler = StandardScaler()
-    target_scaler.fit(np.hstack([y_dk1[:train_idx_limit], y_dk2[:train_idx_limit]]).reshape(-1, 1))
+
+    scalers_path = GRAPH_DIR / "hetero_scalers.pkl"
+    if freeze_scaler and scalers_path.exists():
+        # Reuse previously fitted scalers so the feature distribution stays
+        # fixed — required for stable warm-start fine-tuning on new data.
+        with open(scalers_path, "rb") as f:
+            _saved = pickle.load(f)
+        feature_scaler = _saved['feature_scaler']
+        target_scaler = _saved['target_scaler']
+        print("   🔒 Frozen scaler mode — reusing saved feature/target scalers.")
+    else:
+        if freeze_scaler:
+            print("   ⚠️  freeze_scaler requested but no saved scaler found — fitting fresh.")
+        feature_scaler = StandardScaler()
+        # Fit on all 4 zones so HYDRO/DE features stay in a moderate scaled range
+        # (-0.56 for zero-lag zones). Fitting on DK1+DK2 only pushes HYDRO/DE to
+        # -0.99, amplifying the noise they inject through message passing.
+        feature_scaler.fit(np.vstack([x_dk1[:train_idx_limit], x_dk2[:train_idx_limit], x_de[:train_idx_limit], x_hydro[:train_idx_limit]]))
+
+        target_scaler = StandardScaler()
+        target_scaler.fit(np.hstack([y_dk1[:train_idx_limit], y_dk2[:train_idx_limit]]).reshape(-1, 1))
     
     # 5. Build PyTorch Geometric HeteroData Object
     data = HeteroData()
@@ -109,17 +138,35 @@ def build_heterogeneous_spatiotemporal_graph():
     data['hour', 'belongs_to', 'market'].edge_index = torch.tensor([belongs_src, belongs_dst], dtype=torch.long)
     data['market', 'rev_belongs_to', 'hour'].edge_index = torch.tensor([belongs_dst, belongs_src], dtype=torch.long)
     
-    # Chronological Autoregressive Lag Edges (Hour_t-1 connects to Hour_t)
-    lag_src = []
-    lag_dst = []
+    # Day-Ahead Autoregressive Lag Edges.
+    # Connect each hour to the same hour 1 day (t-24), 2 days (t-48), and 1 week
+    # (t-168) back — all known at gate closure, matching the day-ahead setup.
+    DAY_AHEAD_LAGS = [24, 48, 168]
+    lag_src_parts, lag_dst_parts = [], []
     for zone_idx in range(4):
         offset = zone_idx * num_hours
-        for t in range(1, num_hours):
-            lag_src.append(offset + (t - 1))
-            lag_dst.append(offset + t)
-            
-    data['hour', 'lag_to', 'hour'].edge_index = torch.tensor([lag_src, lag_dst], dtype=torch.long)
-    
+        for lag in DAY_AHEAD_LAGS:
+            t = np.arange(lag, num_hours)
+            lag_src_parts.append(offset + (t - lag))
+            lag_dst_parts.append(offset + t)
+    lag_src = np.concatenate(lag_src_parts)
+    lag_dst = np.concatenate(lag_dst_parts)
+
+    data['hour', 'lag_to', 'hour'].edge_index = torch.tensor(np.stack([lag_src, lag_dst]), dtype=torch.long)
+
+    # Same-Timestep Cross-Zone Edges (DK1 ↔ DK2).
+    # These allow DK1 and DK2 to exchange embeddings at the same hour, directly
+    # modelling the Great Belt interconnect without routing through the market
+    # abstraction node. Only DK1↔DK2 are connected here because HYDRO and DE
+    # have incomplete price data (zero-fill pre-2023); their cross-zone signal
+    # is handled more coarsely via the market-node hierarchy.
+    t_all = np.arange(num_hours)
+    co_src = np.concatenate([t_all, num_hours + t_all])          # DK1→DK2, DK2→DK1
+    co_dst = np.concatenate([num_hours + t_all, t_all])
+    data['hour', 'co_occurs_with', 'hour'].edge_index = torch.tensor(
+        np.stack([co_src, co_dst]), dtype=torch.long
+    )
+
     # Cross-Border Spatial Grid Interconnects (Market-to-Market Topology)
     # 0: DK1, 1: DK2, 2: HYDRO, 3: DE
     inter_src = [0, 1, 0, 3, 0, 2] # Two-way transmission paths
@@ -159,4 +206,5 @@ def build_heterogeneous_spatiotemporal_graph():
     print(f"✅ Success! HeteroData artifact package compiled. Graph nodes: {data['hour'].x.shape[0]} entities.")
 
 if __name__ == "__main__":
-    build_heterogeneous_spatiotemporal_graph()
+    freeze = "--freeze-scaler" in sys.argv
+    build_heterogeneous_spatiotemporal_graph(freeze_scaler=freeze)
