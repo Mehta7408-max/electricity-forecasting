@@ -99,10 +99,10 @@ def build_heterogeneous_spatiotemporal_graph(freeze_scaler=False):
         if freeze_scaler:
             print("   ⚠️  freeze_scaler requested but no saved scaler found — fitting fresh.")
         feature_scaler = StandardScaler()
-        # Fit on DK1+DK2 training data only — same zone restriction as target_scaler.
-        # Including HYDRO/DE (all-zero lag features) would contaminate the mean (~367
-        # instead of ~716) and compress the DK1/DK2 feature range by ~2×.
-        feature_scaler.fit(np.vstack([x_dk1[:train_idx_limit], x_dk2[:train_idx_limit]]))
+        # Fit on all 4 zones so HYDRO/DE features stay in a moderate scaled range
+        # (-0.56 for zero-lag zones). Fitting on DK1+DK2 only pushes HYDRO/DE to
+        # -0.99, amplifying the noise they inject through message passing.
+        feature_scaler.fit(np.vstack([x_dk1[:train_idx_limit], x_dk2[:train_idx_limit], x_de[:train_idx_limit], x_hydro[:train_idx_limit]]))
 
         target_scaler = StandardScaler()
         target_scaler.fit(np.hstack([y_dk1[:train_idx_limit], y_dk2[:train_idx_limit]]).reshape(-1, 1))
