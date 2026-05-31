@@ -60,12 +60,23 @@ AREA_MAP = {
 DEFAULT_START = "2020-01-01"
 
 
+# A normal browser-style User-Agent — the default "python-requests/x" UA is
+# aggressively rate-limited (HTTP 429) by Energinet's CDN.
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0 Safari/537.36",
+    "Accept": "application/json",
+}
+
+
 def _request_with_retry(params: dict) -> dict:
-    """GET Elspotprices with exponential back-off on transient errors."""
+    """GET Elspotprices with exponential back-off on transient errors (incl. 429)."""
     delay = RETRY_BACKOFF
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = requests.get(ELSPOT_URL, params=params, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(ELSPOT_URL, params=params,
+                                headers=HEADERS, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 403:
                 raise RuntimeError(
                     "403 Forbidden from api.energidataservice.dk — the host is "
@@ -73,10 +84,13 @@ def _request_with_retry(params: dict) -> dict:
                     "script where the endpoint is reachable."
                 )
             if resp.status_code in (429, 500, 502, 503, 504):
+                # 429 = rate limited; honour Retry-After if present, else back off hard.
+                retry_after = resp.headers.get("Retry-After")
+                wait = float(retry_after) if (retry_after and retry_after.isdigit()) else delay
                 logger.warning("HTTP %s (attempt %d/%d) — retry in %.0fs",
-                               resp.status_code, attempt, MAX_RETRIES, delay)
-                time.sleep(delay)
-                delay *= 2
+                               resp.status_code, attempt, MAX_RETRIES, wait)
+                time.sleep(wait)
+                delay = min(delay * 2, 60)
                 continue
             resp.raise_for_status()
             return resp.json()
@@ -85,7 +99,7 @@ def _request_with_retry(params: dict) -> dict:
             if attempt == MAX_RETRIES:
                 raise
             time.sleep(delay)
-            delay *= 2
+            delay = min(delay * 2, 60)
     return {}
 
 
@@ -123,34 +137,49 @@ def fetch_energinet(start: str = DEFAULT_START) -> list:
     records = []
     missing_areas = {a: 0 for a in areas}
 
+    PAGE = 10000  # positive limit per page; a month of 4 zones ≈ 3k rows
     for w_start, w_end in _month_windows(start, end):
-        params = {
-            "start": w_start,
-            "end": w_end,
-            "filter": json.dumps({"PriceArea": areas}),
-            "columns": "HourUTC,PriceArea,SpotPriceDKK,SpotPriceEUR",
-            "limit": 0,  # all rows in window
-        }
-        data = _request_with_retry(params)
-        rows = data.get("records", [])
-        for r in rows:
-            area = r.get("PriceArea")
-            zone = AREA_MAP.get(area)
-            if zone is None:
-                continue
-            p_dkk = r.get("SpotPriceDKK")
-            if p_dkk is None:
-                p_eur = r.get("SpotPriceEUR")
-                if p_eur is None:
+        offset = 0
+        win_rows = 0
+        seen = set()
+        while True:
+            params = {
+                "start": w_start,
+                "end": w_end,
+                "filter": json.dumps({"PriceArea": areas}),
+                "columns": "HourUTC,PriceArea,SpotPriceDKK,SpotPriceEUR",
+                "sort": "HourUTC ASC",
+                "limit": PAGE,
+                "offset": offset,
+            }
+            data = _request_with_retry(params)
+            rows = data.get("records", [])
+            if not rows:
+                break
+            for r in rows:
+                area = r.get("PriceArea")
+                zone = AREA_MAP.get(area)
+                if zone is None:
                     continue
-                p_dkk = float(p_eur) * EUR_TO_DKK
-            records.append((_to_hour_str(r["HourUTC"]), zone, float(p_dkk)))
+                p_dkk = r.get("SpotPriceDKK")
+                if p_dkk is None:
+                    p_eur = r.get("SpotPriceEUR")
+                    if p_eur is None:
+                        continue
+                    p_dkk = float(p_eur) * EUR_TO_DKK
+                records.append((_to_hour_str(r["HourUTC"]), zone, float(p_dkk)))
+                seen.add(area)
+            win_rows += len(rows)
+            if len(rows) < PAGE:
+                break
+            offset += PAGE
+            time.sleep(0.4)  # pace pagination within a window
         # Track areas with no data this window
-        seen = {r.get("PriceArea") for r in rows}
         for a in areas:
             if a not in seen:
                 missing_areas[a] += 1
-        logger.info("  %s → %d rows (cumulative %d)", w_start[:7], len(rows), len(records))
+        logger.info("  %s → %d rows (cumulative %d)", w_start[:7], win_rows, len(records))
+        time.sleep(0.4)  # pace between month windows to stay under the rate limit
 
     for a, n in missing_areas.items():
         if n:
