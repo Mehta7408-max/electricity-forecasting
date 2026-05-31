@@ -138,10 +138,9 @@ def build_heterogeneous_spatiotemporal_graph(freeze_scaler=False):
     data['market', 'rev_belongs_to', 'hour'].edge_index = torch.tensor([belongs_dst, belongs_src], dtype=torch.long)
     
     # Day-Ahead Autoregressive Lag Edges.
-    # Connect each hour to the same hour on the previous day (t-24) and the
-    # previous week (t-168) — both known at gate closure, so the temporal graph
-    # structure matches the day-ahead forecasting problem (no t-1 leakage edge).
-    DAY_AHEAD_LAGS = [24, 168]
+    # Connect each hour to the same hour 1 day (t-24), 2 days (t-48), and 1 week
+    # (t-168) back — all known at gate closure, matching the day-ahead setup.
+    DAY_AHEAD_LAGS = [24, 48, 168]
     lag_src_parts, lag_dst_parts = [], []
     for zone_idx in range(4):
         offset = zone_idx * num_hours
@@ -153,7 +152,20 @@ def build_heterogeneous_spatiotemporal_graph(freeze_scaler=False):
     lag_dst = np.concatenate(lag_dst_parts)
 
     data['hour', 'lag_to', 'hour'].edge_index = torch.tensor(np.stack([lag_src, lag_dst]), dtype=torch.long)
-    
+
+    # Same-Timestep Cross-Zone Edges (DK1 ↔ DK2).
+    # These allow DK1 and DK2 to exchange embeddings at the same hour, directly
+    # modelling the Great Belt interconnect without routing through the market
+    # abstraction node. Only DK1↔DK2 are connected here because HYDRO and DE
+    # have incomplete price data (zero-fill pre-2023); their cross-zone signal
+    # is handled more coarsely via the market-node hierarchy.
+    t_all = np.arange(num_hours)
+    co_src = np.concatenate([t_all, num_hours + t_all])          # DK1→DK2, DK2→DK1
+    co_dst = np.concatenate([num_hours + t_all, t_all])
+    data['hour', 'co_occurs_with', 'hour'].edge_index = torch.tensor(
+        np.stack([co_src, co_dst]), dtype=torch.long
+    )
+
     # Cross-Border Spatial Grid Interconnects (Market-to-Market Topology)
     # 0: DK1, 1: DK2, 2: HYDRO, 3: DE
     inter_src = [0, 1, 0, 3, 0, 2] # Two-way transmission paths
