@@ -34,7 +34,27 @@ def init_database():
             humidity_pct REAL
         )
     """)
-    
+
+    # Per-zone fundamentals (demand + renewable generation).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS zone_fundamentals (
+            hour_utc TEXT,
+            price_zone TEXT,
+            load_mwh REAL,
+            renewable_mwh REAL,
+            PRIMARY KEY (hour_utc, price_zone)
+        )
+    """)
+
+    # Market-wide factors (fuel + carbon), broadcast to all zones.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS market_factors (
+            hour_utc TEXT PRIMARY KEY,
+            gas_dkk REAL,
+            co2_dkk REAL
+        )
+    """)
+
     conn.commit()
     conn.close()
     print(f"✅ Database ready: {DB_PATH}")
