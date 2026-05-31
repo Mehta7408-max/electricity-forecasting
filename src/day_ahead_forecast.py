@@ -20,7 +20,7 @@ from pathlib import Path
 from sklearn.metrics import mean_absolute_error, r2_score
 
 sys.path.insert(0, str(Path(__file__).parent))
-from hetero_config import DEVICE, ARTIFACTS_DIR, GRAPH_DIR
+from hetero_config import DEVICE, ARTIFACTS_DIR, GRAPH_DIR, load_y_scaler, inverse_scale_y
 from hetero_models import load_hetero_model
 from hetero_pipeline import prepare_multi_area_data
 
@@ -32,19 +32,21 @@ def _load():
     num_hours = int(data['hour'].num_hours_per_zone)
     model, x_override = load_hetero_model(data, ARTIFACTS_DIR / "best_hetero_model.pt", DEVICE)
     x_base = (x_override.cpu() if x_override is not None else data['hour'].x).clone()
-    return model, data, num_hours, x_base
+    y_mean, y_scale = load_y_scaler()
+    return model, data, num_hours, x_base, y_mean, y_scale
 
 
 @torch.no_grad()
-def _infer(model, data, x_base, num_hours):
+def _infer(model, data, x_base, num_hours, y_mean=0.0, y_scale=1.0):
     x_dict = {k: v.to(DEVICE) for k, v in data.x_dict.items()}
     x_dict['hour'] = x_base.to(DEVICE)
     ei = {k: v.to(DEVICE) for k, v in data.edge_index_dict.items()}
-    return model(x_dict, ei, num_hours=num_hours).view(-1).cpu().numpy()
+    out_scaled = model(x_dict, ei, num_hours=num_hours).view(-1).cpu().numpy()
+    return inverse_scale_y(out_scaled, y_mean, y_scale)
 
 
-def compute_per_zone_metrics(model, data, num_hours, x_base):
-    out = _infer(model, data, x_base, num_hours)
+def compute_per_zone_metrics(model, data, num_hours, x_base, y_mean=0.0, y_scale=1.0):
+    out = _infer(model, data, x_base, num_hours, y_mean, y_scale)
     y   = data['hour'].y.cpu().numpy()
     tm  = data['hour'].test_mask.cpu().numpy()
 
@@ -65,7 +67,7 @@ def compute_per_zone_metrics(model, data, num_hours, x_base):
     return results
 
 
-def compute_hourly_price_profiles(model, data, num_hours, x_base):
+def compute_hourly_price_profiles(model, data, num_hours, x_base, y_mean=0.0, y_scale=1.0):
     """Average predicted vs actual price by hour-of-day and day-of-week."""
     import pandas as pd
     df_dk1, _, _, _, _ = prepare_multi_area_data()
@@ -74,7 +76,7 @@ def compute_hourly_price_profiles(model, data, num_hours, x_base):
     hour_of_day = ts[test_start:].hour.values
     day_of_week = ts[test_start:].dayofweek.values
 
-    out = _infer(model, data, x_base, num_hours)
+    out = _infer(model, data, x_base, num_hours, y_mean, y_scale)
     y   = data['hour'].y.cpu().numpy()
     tm  = data['hour'].test_mask.cpu().numpy()
 
@@ -102,7 +104,7 @@ def compute_hourly_price_profiles(model, data, num_hours, x_base):
     return profiles
 
 
-def compute_hour_position_mae(model, data, num_hours, x_base):
+def compute_hour_position_mae(model, data, num_hours, x_base, y_mean=0.0, y_scale=1.0):
     """
     Day-ahead error by delivery hour (00:00 … 23:00).
 
@@ -118,7 +120,7 @@ def compute_hour_position_mae(model, data, num_hours, x_base):
     ts = pd.to_datetime(df_dk1['timestamp'].values)
     hour_of_day_full = ts.hour.values  # aligned to the per-zone hour index
 
-    out = _infer(model, data, x_base, num_hours)
+    out = _infer(model, data, x_base, num_hours, y_mean, y_scale)
     y   = data['hour'].y.cpu().numpy()
     tm  = data['hour'].test_mask.cpu().numpy()
 
@@ -139,18 +141,18 @@ def run_day_ahead_analysis():
     print("\n📅 Running Day-Ahead Multi-Zone Forecast Analysis...")
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    model, data, num_hours, x_base = _load()
+    model, data, num_hours, x_base, y_mean, y_scale = _load()
     n_feats = x_base.shape[1]
     print(f"   Model input features: {n_feats}")
 
     print("  [1/3] Per-zone metrics (DK1, DK2, HYDRO, DE)...")
-    zone_metrics = compute_per_zone_metrics(model, data, num_hours, x_base)
+    zone_metrics = compute_per_zone_metrics(model, data, num_hours, x_base, y_mean, y_scale)
 
     print("  [2/3] Hourly and weekly price profiles...")
-    profiles = compute_hourly_price_profiles(model, data, num_hours, x_base)
+    profiles = compute_hourly_price_profiles(model, data, num_hours, x_base, y_mean, y_scale)
 
     print("  [3/3] MAE by delivery hour (day-ahead, direct 24h)...")
-    horizon = compute_hour_position_mae(model, data, num_hours, x_base)
+    horizon = compute_hour_position_mae(model, data, num_hours, x_base, y_mean, y_scale)
 
     summary = {
         'per_zone_metrics': zone_metrics,

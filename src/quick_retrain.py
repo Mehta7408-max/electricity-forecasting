@@ -1,6 +1,9 @@
 """
 Quick retrain script — trains HeteroPriceForecaster on the current graph
-for up to 120 epochs with validation-based early stopping.
+for up to 200 epochs with validation-based early stopping.
+
+Targets are StandardScaler-normalized during training (same as homo GNN) and
+inverse-transformed back to DKK for all reported metrics.
 Overwrites best_hetero_model.pt when complete.
 """
 import sys, json, time
@@ -8,6 +11,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, r2_score
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -16,7 +20,7 @@ from hetero_models import HeteroPriceForecaster
 from mlflow_config import setup_mlflow
 
 
-def quick_retrain(hidden_channels=64, max_epochs=120, patience=20, warm_start=False):
+def quick_retrain(hidden_channels=128, max_epochs=200, patience=25, warm_start=False):
     """
     Train HeteroPriceForecaster on the current graph.
 
@@ -106,11 +110,18 @@ def quick_retrain(hidden_channels=64, max_epochs=120, patience=20, warm_start=Fa
 
         x_dict  = {k: v.to(DEVICE) for k, v in data.x_dict.items()}
         ei      = {k: v.to(DEVICE) for k, v in data.edge_index_dict.items()}
-        y       = data['hour'].y.to(DEVICE)
         y_np    = data['hour'].y.cpu().numpy()
         tr_mask = data['hour'].train_mask.to(DEVICE)
         vl_mask = data['hour'].val_mask.to(DEVICE)
         te_mask = data['hour'].test_mask.to(DEVICE)
+
+        # Scale y targets: fit on training split, transform all splits.
+        # This matches the homo GNN training regime and stabilises MSE optimisation.
+        y_scaler = StandardScaler()
+        tr_np = data['hour'].train_mask.cpu().numpy()
+        y_scaler.fit(y_np[tr_np].reshape(-1, 1))
+        y_scaled = y_scaler.transform(y_np.reshape(-1, 1)).ravel()
+        y = torch.tensor(y_scaled, dtype=torch.float32).to(DEVICE)
 
         best_val  = float('inf')
         patience_ctr = 0
@@ -129,7 +140,11 @@ def quick_retrain(hidden_channels=64, max_epochs=120, patience=20, warm_start=Fa
             with torch.no_grad():
                 val_out  = model(x_dict, ei, num_hours=num_hours).view(-1)
                 val_loss = F.mse_loss(val_out[vl_mask], y[vl_mask]).item()
-                val_mae  = F.l1_loss(val_out[vl_mask], y[vl_mask]).item()
+                # Inverse-transform to DKK for readable reporting
+                vl_np  = data['hour'].val_mask.cpu().numpy()
+                vp_dkk = y_scaler.inverse_transform(val_out[vl_mask].cpu().numpy().reshape(-1, 1)).ravel()
+                ya_dkk = y_np[vl_np]
+                val_mae = float(mean_absolute_error(ya_dkk, vp_dkk))
 
             scheduler.step(val_loss)
 
@@ -143,7 +158,7 @@ def quick_retrain(hidden_channels=64, max_epochs=120, patience=20, warm_start=Fa
 
             if epoch == 1 or epoch % 10 == 0:
                 elapsed = time.time() - t0
-                print(f"   Epoch {epoch:3d} | Train MSE: {loss.item():10.1f} | Val MAE: {val_mae:6.1f} DKK | {elapsed:.0f}s")
+                print(f"   Epoch {epoch:3d} | Train MSE: {loss.item():10.4f} | Val MAE: {val_mae:6.1f} DKK | {elapsed:.0f}s")
 
             if val_loss < best_val:
                 best_val = val_loss
@@ -159,11 +174,12 @@ def quick_retrain(hidden_channels=64, max_epochs=120, patience=20, warm_start=Fa
         model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE, weights_only=False))
         model.eval()
         with torch.no_grad():
-            final = model(x_dict, ei, num_hours=num_hours).view(-1).cpu().numpy()
+            final_scaled = model(x_dict, ei, num_hours=num_hours).view(-1).cpu().numpy()
 
         tm_np = te_mask.cpu().numpy()
         y_te  = y_np[tm_np]
-        p_te  = final[tm_np]
+        # Inverse-transform scaled predictions → DKK
+        p_te  = y_scaler.inverse_transform(final_scaled[tm_np].reshape(-1, 1)).ravel()
 
         smape = float(np.mean(2 * np.abs(p_te - y_te) / (np.abs(y_te) + np.abs(p_te) + 1e-8)) * 100)
         metrics = {
@@ -193,6 +209,11 @@ def quick_retrain(hidden_channels=64, max_epochs=120, patience=20, warm_start=Fa
 
         with open(ARTIFACTS_DIR / "hetero_metrics_clean.json", "w") as f:
             json.dump(metrics, f, indent=2)
+
+        # Persist scaler parameters so analysis scripts can inverse-transform.
+        scaler_params = {"mean": float(y_scaler.mean_[0]), "scale": float(y_scaler.scale_[0])}
+        with open(ARTIFACTS_DIR / "y_scaler.json", "w") as f:
+            json.dump(scaler_params, f)
 
         print(f"\n✅ Checkpoint saved → {ckpt_path}")
         return metrics
