@@ -66,6 +66,11 @@ def st_train(
     val_mask  = data['hour'].val_mask  .to(DEVICE) & dk12
     test_mask = data['hour'].test_mask .to(DEVICE) & dk12
 
+    # Auxiliary mask: DE + HYDRO TRAINING nodes only (their data is real in the
+    # 2020-2024 train window). Predicting them as a 0.1x side-task forces richer
+    # cross-zone representations that feed DK1/DK2 via co_occurs/market edges.
+    de_hydro_tr = data['hour'].train_mask.to(DEVICE) & (~dk12)
+
     # ── Target scaler ─────────────────────────────────────────────────────────
     scaler_path = GRAPH_DIR / "hetero_scalers.pkl"
     with open(scaler_path, 'rb') as f:
@@ -108,8 +113,10 @@ def st_train(
     for epoch in range(1, max_epochs + 1):
         model.train()
         optimizer.zero_grad()
-        out  = model(x_dict, edge_index_dict)
-        loss = F.mse_loss(out[tr_mask], y_scaled[tr_mask])
+        out       = model(x_dict, edge_index_dict)
+        main_loss = F.mse_loss(out[tr_mask], y_scaled[tr_mask])
+        aux_loss  = F.mse_loss(out[de_hydro_tr], y_scaled[de_hydro_tr])
+        loss      = main_loss + 0.1 * aux_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()

@@ -125,8 +125,11 @@ class HeteroSTPriceForecaster(nn.Module):
         H = hidden_channels
 
         # Input projections (per node type)
-        self.hour_proj   = nn.Linear(in_channels, H)
-        self.market_proj = nn.Linear(4, H)           # 4 = one-hot market size
+        self.hour_proj    = nn.Linear(in_channels, H)
+        # 2-layer residual market MLP — richer zone embedding than a plain Linear
+        # (matches the HeteroPriceForecaster recipe that lifted hetero to 162.8 DKK).
+        self.market_proj  = nn.Linear(4, H)          # 4 = one-hot market size
+        self.market_proj2 = nn.Linear(H, H)
 
         # Spatio-temporal blocks
         self.st_blocks = nn.ModuleList([
@@ -142,9 +145,10 @@ class HeteroSTPriceForecaster(nn.Module):
         )
 
     def forward(self, x_dict: dict, edge_index_dict: dict) -> torch.Tensor:
+        m0 = F.relu(self.market_proj(x_dict['market']))
         x = {
-            'hour':   F.relu(self.hour_proj  (x_dict['hour'])),
-            'market': F.relu(self.market_proj(x_dict['market'])),
+            'hour':   F.relu(self.hour_proj(x_dict['hour'])),
+            'market': F.relu(self.market_proj2(m0) + m0),   # 2-layer residual MLP
         }
         for block in self.st_blocks:
             x = block(x, edge_index_dict)
