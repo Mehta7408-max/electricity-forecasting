@@ -127,9 +127,68 @@ def check():
         return False
 
 
+def ingest_from_csv(csv_path: str):
+    """Ingest DK1/DK2 fundamentals from a local ProductionConsumptionSettlement CSV.
+
+    The CSV is semicolon-delimited with European decimal format (comma as decimal
+    separator), as downloaded directly from Energinet's open-data portal.
+    Use this when the API endpoint is firewalled (e.g. sandbox / university network):
+        python3 ingest_energinet_fundamentals.py --csv ProductionConsumptionSettlement.csv
+    """
+    import pandas as pd
+    wind_cols = [
+        'OffshoreWindLt100MW_MWh', 'OffshoreWindGe100MW_MWh',
+        'OnshoreWindLt50kW_MWh',   'OnshoreWindGe50kW_MWh',
+    ]
+    solar_cols = [
+        'SolarPowerLt10kW_MWh', 'SolarPowerGe10Lt40kW_MWh',
+        'SolarPowerGe40kW_MWh', 'SolarPowerSelfConMWh',
+    ]
+    needed = ['HourUTC', 'PriceArea', 'GrossConsumptionMWh', 'HydroPowerMWh'] + wind_cols + solar_cols
+
+    df = pd.read_csv(csv_path, sep=';', decimal=',', usecols=needed)
+    df = df[df['PriceArea'].isin(['DK1', 'DK2'])]
+    df['hour_utc'] = pd.to_datetime(df['HourUTC']).dt.strftime('%Y-%m-%d %H:00:00')
+    df['load_mwh'] = df['GrossConsumptionMWh'].fillna(0)
+    df['renewable_mwh'] = (
+        df[wind_cols].fillna(0).sum(axis=1)
+        + df[solar_cols].fillna(0).sum(axis=1)
+        + df['HydroPowerMWh'].fillna(0)
+    )
+    records = list(zip(df['hour_utc'], df['PriceArea'], df['load_mwh'], df['renewable_mwh']))
+    logger.info("Parsed %d rows from %s", len(records), csv_path)
+
+    init_database()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM zone_fundamentals WHERE price_zone IN ('DK1','DK2')")
+    cur.executemany(
+        "INSERT OR REPLACE INTO zone_fundamentals(hour_utc, price_zone, load_mwh, renewable_mwh) "
+        "VALUES(?,?,?,?)",
+        records,
+    )
+    conn.commit()
+    summary = run_query(
+        "SELECT price_zone, COUNT(*) n, MIN(hour_utc) lo, MAX(hour_utc) hi, "
+        "AVG(load_mwh) load, AVG(renewable_mwh) ren "
+        "FROM zone_fundamentals GROUP BY price_zone ORDER BY price_zone"
+    )
+    print("\n📊 zone_fundamentals coverage after CSV ingest:")
+    print(summary.to_string(index=False))
+    conn.close()
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--csv",   metavar="FILE",
+                    help="Ingest from local ProductionConsumptionSettlement CSV "
+                         "(semicolon-delimited, European decimal) instead of API")
     args = ap.parse_args()
-    sys.exit(0 if check() else 1) if args.check else ingest()
+    if args.check:
+        sys.exit(0 if check() else 1)
+    elif args.csv:
+        ingest_from_csv(args.csv)
+    else:
+        ingest()

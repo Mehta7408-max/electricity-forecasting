@@ -72,7 +72,7 @@ def homo_retrain(hidden_channels=128, max_epochs=200, patience=25, rebuild_graph
             num_features=num_feats,
             hidden_channels=hidden_channels,
             num_layers=3,
-            dropout=0.2,
+            dropout=0.0,  # BN + dropout conflict: BN already regularises
         ).to(DEVICE)
         params = sum(p.numel() for p in model.parameters())
         print(f"   Params: {params:,} | hidden_channels={hidden_channels}")
