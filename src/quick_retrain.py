@@ -111,15 +111,28 @@ def quick_retrain(hidden_channels=128, max_epochs=200, patience=25, warm_start=F
         x_dict  = {k: v.to(DEVICE) for k, v in data.x_dict.items()}
         ei      = {k: v.to(DEVICE) for k, v in data.edge_index_dict.items()}
         y_np    = data['hour'].y.cpu().numpy()
-        tr_mask = data['hour'].train_mask.to(DEVICE)
-        vl_mask = data['hour'].val_mask.to(DEVICE)
-        te_mask = data['hour'].test_mask.to(DEVICE)
+        tr_mask_full = data['hour'].train_mask.to(DEVICE)
+        vl_mask_full = data['hour'].val_mask.to(DEVICE)
+        te_mask_full = data['hour'].test_mask.to(DEVICE)
 
-        # Scale y targets: fit on training split, transform all splits.
-        # This matches the homo GNN training regime and stabilises MSE optimisation.
+        # Restrict loss, val, and test evaluation to DK1+DK2 only — matching the
+        # homo GNN which also trains/evaluates on DK1+DK2 exclusively.
+        # HYDRO and DE have all-zero prices (placeholder data); including them in
+        # the loss contaminates gradients and halves the effective training signal.
+        # All 4 zones still participate in message-passing for graph structure.
+        n2 = 2 * num_hours  # first 2×N nodes = DK1 + DK2
+        dk12 = torch.zeros(4 * num_hours, dtype=torch.bool, device=DEVICE)
+        dk12[:n2] = True
+        tr_mask = tr_mask_full & dk12
+        vl_mask = vl_mask_full & dk12
+        te_mask = te_mask_full & dk12
+
+        # Scale y targets: fit on DK1+DK2 training nodes only (real prices).
+        # Using all-zone y would contaminate the scaler with ~50% zeros.
         y_scaler = StandardScaler()
-        tr_np = data['hour'].train_mask.cpu().numpy()
-        y_scaler.fit(y_np[tr_np].reshape(-1, 1))
+        dk12_np = dk12.cpu().numpy()
+        tr_np   = data['hour'].train_mask.cpu().numpy()
+        y_scaler.fit(y_np[tr_np & dk12_np].reshape(-1, 1))
         y_scaled = y_scaler.transform(y_np.reshape(-1, 1)).ravel()
         y = torch.tensor(y_scaled, dtype=torch.float32).to(DEVICE)
 
@@ -140,8 +153,8 @@ def quick_retrain(hidden_channels=128, max_epochs=200, patience=25, warm_start=F
             with torch.no_grad():
                 val_out  = model(x_dict, ei, num_hours=num_hours).view(-1)
                 val_loss = F.mse_loss(val_out[vl_mask], y[vl_mask]).item()
-                # Inverse-transform to DKK for readable reporting
-                vl_np  = data['hour'].val_mask.cpu().numpy()
+                # Inverse-transform to DKK for readable reporting (DK1+DK2 only)
+                vl_np  = vl_mask.cpu().numpy()
                 vp_dkk = y_scaler.inverse_transform(val_out[vl_mask].cpu().numpy().reshape(-1, 1)).ravel()
                 ya_dkk = y_np[vl_np]
                 val_mae = float(mean_absolute_error(ya_dkk, vp_dkk))
@@ -183,12 +196,13 @@ def quick_retrain(hidden_channels=128, max_epochs=200, patience=25, warm_start=F
 
         smape = float(np.mean(2 * np.abs(p_te - y_te) / (np.abs(y_te) + np.abs(p_te) + 1e-8)) * 100)
         metrics = {
+            "eval_zones": "DK1+DK2",
             "mae":   float(mean_absolute_error(y_te, p_te)),
             "rmse":  float(np.sqrt(np.mean((p_te - y_te)**2))),
             "r2":    float(r2_score(y_te, p_te)),
             "smape": smape,
         }
-        print(f"\n📊 Test Results:")
+        print(f"\n📊 Test Results (DK1 + DK2 — same evaluation zones as homo GNN):")
         print(f"   MAE:   {metrics['mae']:.2f} DKK")
         print(f"   RMSE:  {metrics['rmse']:.2f} DKK")
         print(f"   R²:    {metrics['r2']:.4f}")
