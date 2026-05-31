@@ -2,19 +2,18 @@
 import sqlite3
 import os
 import pandas as pd
-from pathlib import Path
 
-# FAIL-SAFE: Use the global Linux temporary directory which guarantees write permissions
-DB_PATH = Path("/tmp/energy.db")
+# Canonical project database — lives next to this module (src/electricity.db).
+# This is the single source of truth read by the graph builders and trainers.
+DB_PATH = os.path.join(os.path.dirname(__file__), 'electricity.db')
 
 def get_connection():
-    """Create and return database connection pointing to a guaranteed writable path."""
-    db_path = os.path.join(os.path.dirname(__file__), 'electricity.db')
-    return sqlite3.connect(db_path) 
+    """Connect to the canonical project database (src/electricity.db)."""
+    return sqlite3.connect(DB_PATH)
 
 def init_database():
     """Initialize localized database tables."""
-    print(f"📁 Initializing fail-safe database environment at: {DB_PATH}")
+    print(f"📁 Initializing database at: {DB_PATH}")
     conn = get_connection()
     
     conn.execute("""
@@ -38,7 +37,7 @@ def init_database():
     
     conn.commit()
     conn.close()
-    print("✅ Database successfully initialized in /tmp/ directory!")
+    print(f"✅ Database ready: {DB_PATH}")
 
 def run_query(query: str, params=None):
     """Run SQL query and return securely as a Pandas DataFrame."""
