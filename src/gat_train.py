@@ -1,8 +1,21 @@
 # OVERWRITE EXACTLY: src/gat_train.py
 """
-Training Loop for Multi-Head Heterogeneous Graph Attention Network (HeteroGAT).
-Uses HeteroGATPriceForecaster which supports per-edge-type GATConv and
-optional attention weight extraction.
+[FOOTNOTE EXPERIMENT — NOT A PRIMARY MODEL]
+
+Training loop for the Heterogeneous Graph Attention Network (HeteroGAT).
+
+This is retained only as a documented negative result. Under a fair
+evaluation (StandardScaler targets, DK1+DK2-only test set — identical to
+HeteroSAGE and the homogeneous GNN), HeteroGAT scored **179 DKK MAE vs
+HeteroSAGE's 167 DKK** — strictly worse. The ablation study independently
+shows the cross-border `interconnects` edges (precisely what attention would
+re-weight) contribute only ~+1 DKK, so there is almost nothing for an
+attention mechanism to learn over plain GraphSAGE mean/sum aggregation.
+
+Conclusion for the thesis: attention does not improve over GraphSAGE
+aggregation for this graph; the primary heterogeneous model is HeteroSAGE.
+HeteroGAT is excluded from the headline comparison (compare_models.py) and
+kept here purely for reproducibility of that finding.
 """
 import torch
 import torch.nn.functional as F
