@@ -54,7 +54,7 @@ def quick_retrain(hidden_channels=128, max_epochs=200, patience=25, warm_start=F
         patience = min(patience, 10)
     else:
         _ckpt = None
-        lr = 0.002
+        lr = 0.001  # match homo GNN lr for fair comparison
 
     # ── MLflow setup ───────────────────────────────────────────────────────────
     try:
@@ -81,6 +81,9 @@ def quick_retrain(hidden_channels=128, max_epochs=200, patience=25, warm_start=F
             except Exception:
                 pass
 
+        torch.manual_seed(42)
+        np.random.seed(42)
+
         data = torch.load(GRAPH_DIR / "hetero_graph.pt", map_location=DEVICE, weights_only=False)
         num_hours = int(data['hour'].num_hours_per_zone)
 
@@ -103,9 +106,9 @@ def quick_retrain(hidden_channels=128, max_epochs=200, patience=25, warm_start=F
         params = sum(p.numel() for p in model.parameters())
         print(f"   Params: {params:,} | hidden_channels={hidden_channels} | {num_hours} hours/zone")
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=8
+            optimizer, mode='min', factor=0.5, patience=10
         )
 
         x_dict  = {k: v.to(DEVICE) for k, v in data.x_dict.items()}
