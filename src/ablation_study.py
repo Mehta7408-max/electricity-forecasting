@@ -1,12 +1,13 @@
 """
 Ablation study: contribution of each graph component to forecast accuracy.
 
-Four inference-time ablation variants (no retraining needed):
+Inference-time ablation variants (no retraining needed):
   A. Full model          — baseline
   B. No temporal edges   — remove 'lag_to' (hour→hour autoregressive links)
   C. No spatial edges    — remove 'interconnects' (cross-border market connections)
   D. No market bridge    — remove 'belongs_to' + 'rev_belongs_to' (market aggregation nodes)
   E. No market context   — B + D combined (graph reduces to isolated zone time-series)
+  F. No co_occurs_with   — remove direct DK1↔DK2 same-timestep edges
 
 For each variant, affected edge_index entries are replaced with a single dummy
 self-loop (node 0 → node 0) so HeteroConv still receives valid edge tensors
@@ -112,6 +113,12 @@ def run_ablation_study():
     ei_e[('market', 'rev_belongs_to', 'hour')]   = _DUMMY_EDGE.clone()
     results['E_no_market_context'] = _eval(model, data, ei_e, num_hours, x_override, y_mean, y_scale)
 
+    if ('hour', 'co_occurs_with', 'hour') in base_ei:
+        print("  [F] No co_occurs_with (remove direct DK1↔DK2 same-timestep edges)...")
+        ei_f = dict(base_ei)
+        ei_f[('hour', 'co_occurs_with', 'hour')] = _DUMMY_EDGE.clone()
+        results['F_no_cooccurs'] = _eval(model, data, ei_f, num_hours, x_override, y_mean, y_scale)
+
     # ── Compute MAE delta vs full model ──────────────────────────────────────
     base_dk1_mae = results['A_full_model']['DK1']['mae']
     for variant, metrics in results.items():
@@ -134,16 +141,21 @@ def run_ablation_study():
         'C_no_spatial':       'C. No spatial (interconnects)',
         'D_no_market_bridge': 'D. No market bridge',
         'E_no_market_context':'E. No market context',
+        'F_no_cooccurs':      'F. No co_occurs (DK1↔DK2)',
     }
     for k, label in variant_labels.items():
+        if k not in results:
+            continue
         m = results[k]['DK1']
         delta_str = f"{m['mae_vs_full']:+.2f}"
-        print(f"  {label:<30} {m['mae']:>10.2f} {delta_str:>10} {m['r2']:>8.4f}")
+        print(f"  {label:<34} {m['mae']:>10.2f} {delta_str:>10} {m['r2']:>8.4f}")
 
     print("\n  DK_combined MAE:")
     for k, label in variant_labels.items():
+        if k not in results:
+            continue
         m = results[k]['DK_combined']
-        print(f"  {label:<30} {m['mae']:>8.2f} DKK  (R²={m['r2']:.4f})")
+        print(f"  {label:<34} {m['mae']:>8.2f} DKK  (R²={m['r2']:.4f})")
 
     print(f"\n✅ Saved → {out_path}")
     return results
