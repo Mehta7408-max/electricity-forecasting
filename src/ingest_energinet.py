@@ -45,9 +45,9 @@ logger = logging.getLogger(__name__)
 
 ELSPOT_URL = "https://api.energidataservice.dk/dataset/Elspotprices"
 EUR_TO_DKK = 7.46
-REQUEST_TIMEOUT = 60
-MAX_RETRIES = 4
-RETRY_BACKOFF = 2.0  # seconds, doubles each retry
+REQUEST_TIMEOUT = 180  # large pages (100k rows) are big JSON downloads
+MAX_RETRIES = 5
+RETRY_BACKOFF = 5.0  # seconds, doubles each retry (capped at 60)
 
 # Energinet PriceArea string  →  our internal model zone label
 AREA_MAP = {
@@ -128,63 +128,65 @@ def _to_hour_str(hour_utc: str) -> str:
 
 def fetch_energinet(start: str = DEFAULT_START) -> list:
     """
-    Pull Elspotprices for all mapped areas from `start` to now, one month per
-    request (all areas in a single filter). Returns list of
-    (hour_str, model_zone, price_dkk) tuples.
+    Pull Elspotprices for all mapped areas across the WHOLE range [start, now]
+    in a handful of large pages (offset pagination). This minimises the number
+    of HTTP requests — important because Energinet rate-limits per-IP hard
+    (especially on shared university/corporate egress IPs), returning HTTP 429
+    with multi-minute Retry-After hints. ~6 years × 4 zones ≈ 210k rows, so at
+    100k rows/page this is only ~3 requests total.
+
+    Returns a list of (hour_str, model_zone, price_dkk) tuples.
     """
     end = datetime.now(timezone.utc)
+    end_iso = end.strftime("%Y-%m-%dT%H:%M")
+    start_iso = datetime.fromisoformat(start).strftime("%Y-%m-%dT%H:%M")
     areas = list(AREA_MAP.keys())
     records = []
-    missing_areas = {a: 0 for a in areas}
+    seen = set()
 
-    PAGE = 10000  # positive limit per page; a month of 4 zones ≈ 3k rows
-    for w_start, w_end in _month_windows(start, end):
-        offset = 0
-        win_rows = 0
-        seen = set()
-        while True:
-            params = {
-                "start": w_start,
-                "end": w_end,
-                "filter": json.dumps({"PriceArea": areas}),
-                "columns": "HourUTC,PriceArea,SpotPriceDKK,SpotPriceEUR",
-                "sort": "HourUTC ASC",
-                "limit": PAGE,
-                "offset": offset,
-            }
-            data = _request_with_retry(params)
-            rows = data.get("records", [])
-            if not rows:
-                break
-            for r in rows:
-                area = r.get("PriceArea")
-                zone = AREA_MAP.get(area)
-                if zone is None:
+    PAGE = 100000  # large page → very few requests → stays under the rate limit
+    offset = 0
+    page_no = 0
+    while True:
+        params = {
+            "start": start_iso,
+            "end": end_iso,
+            "filter": json.dumps({"PriceArea": areas}),
+            "columns": "HourUTC,PriceArea,SpotPriceDKK,SpotPriceEUR",
+            "sort": "HourUTC ASC",
+            "limit": PAGE,
+            "offset": offset,
+        }
+        data = _request_with_retry(params)
+        rows = data.get("records", [])
+        if not rows:
+            break
+        for r in rows:
+            area = r.get("PriceArea")
+            zone = AREA_MAP.get(area)
+            if zone is None:
+                continue
+            p_dkk = r.get("SpotPriceDKK")
+            if p_dkk is None:
+                p_eur = r.get("SpotPriceEUR")
+                if p_eur is None:
                     continue
-                p_dkk = r.get("SpotPriceDKK")
-                if p_dkk is None:
-                    p_eur = r.get("SpotPriceEUR")
-                    if p_eur is None:
-                        continue
-                    p_dkk = float(p_eur) * EUR_TO_DKK
-                records.append((_to_hour_str(r["HourUTC"]), zone, float(p_dkk)))
-                seen.add(area)
-            win_rows += len(rows)
-            if len(rows) < PAGE:
-                break
-            offset += PAGE
-            time.sleep(0.4)  # pace pagination within a window
-        # Track areas with no data this window
-        for a in areas:
-            if a not in seen:
-                missing_areas[a] += 1
-        logger.info("  %s → %d rows (cumulative %d)", w_start[:7], win_rows, len(records))
-        time.sleep(0.4)  # pace between month windows to stay under the rate limit
+                p_dkk = float(p_eur) * EUR_TO_DKK
+            records.append((_to_hour_str(r["HourUTC"]), zone, float(p_dkk)))
+            seen.add(area)
+        page_no += 1
+        logger.info("  page %d (offset %d) → %d rows (cumulative %d)",
+                    page_no, offset, len(rows), len(records))
+        if len(rows) < PAGE:
+            break
+        offset += PAGE
+        time.sleep(2.0)  # generous pacing between the few large pages
 
-    for a, n in missing_areas.items():
-        if n:
-            logger.warning("Area %s returned no data in %d month-window(s) — "
-                           "verify the PriceArea label is correct for Energinet.", a, n)
+    for a in areas:
+        if a not in seen:
+            logger.warning("Area %s returned NO data across the whole range — "
+                           "verify the PriceArea label is correct for Energinet "
+                           "(e.g. DE-LU may be labelled 'DE').", a)
     return records
 
 
