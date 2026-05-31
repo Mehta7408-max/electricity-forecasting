@@ -126,25 +126,23 @@ def _to_hour_str(hour_utc: str) -> str:
         return hour_utc.replace("T", " ")
 
 
-def fetch_energinet(start: str = DEFAULT_START) -> list:
-    """
-    Pull Elspotprices for all mapped areas across the WHOLE range [start, now]
-    in a handful of large pages (offset pagination). This minimises the number
-    of HTTP requests — important because Energinet rate-limits per-IP hard
-    (especially on shared university/corporate egress IPs), returning HTTP 429
-    with multi-minute Retry-After hints. ~6 years × 4 zones ≈ 210k rows, so at
-    100k rows/page this is only ~3 requests total.
+# Single-shot page size. Energinet returns exactly the limit we ask for and
+# honours large values, so one big request fetches the entire history at once.
+# This is critical: on rate-limited (shared university/corporate) IPs, only the
+# FIRST request of a run reliably succeeds — a second request gets a multi-minute
+# 429 penalty. Asking for everything in one request sidesteps that entirely.
+# ~6 years × 4 zones ≈ 210k rows; 2,000,000 comfortably covers it.
+PAGE = 2_000_000
 
-    Returns a list of (hour_str, model_zone, price_dkk) tuples.
+
+def _iter_pages(start: str):
     """
-    end = datetime.now(timezone.utc)
-    end_iso = end.strftime("%Y-%m-%dT%H:%M")
+    Yield (page_no, rows) from Elspotprices over [start, now]. Uses one huge
+    page so it is normally a single request; still paginates as a safety net.
+    """
+    end_iso   = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
     start_iso = datetime.fromisoformat(start).strftime("%Y-%m-%dT%H:%M")
     areas = list(AREA_MAP.keys())
-    records = []
-    seen = set()
-
-    PAGE = 100000  # large page → very few requests → stays under the rate limit
     offset = 0
     page_no = 0
     while True:
@@ -160,65 +158,76 @@ def fetch_energinet(start: str = DEFAULT_START) -> list:
         data = _request_with_retry(params)
         rows = data.get("records", [])
         if not rows:
-            break
-        for r in rows:
-            area = r.get("PriceArea")
-            zone = AREA_MAP.get(area)
-            if zone is None:
-                continue
-            p_dkk = r.get("SpotPriceDKK")
-            if p_dkk is None:
-                p_eur = r.get("SpotPriceEUR")
-                if p_eur is None:
-                    continue
-                p_dkk = float(p_eur) * EUR_TO_DKK
-            records.append((_to_hour_str(r["HourUTC"]), zone, float(p_dkk)))
-            seen.add(area)
+            return
         page_no += 1
-        logger.info("  page %d (offset %d) → %d rows (cumulative %d)",
-                    page_no, offset, len(rows), len(records))
+        yield page_no, rows
         if len(rows) < PAGE:
-            break
+            return
         offset += PAGE
-        time.sleep(2.0)  # generous pacing between the few large pages
-
-    for a in areas:
-        if a not in seen:
-            logger.warning("Area %s returned NO data across the whole range — "
-                           "verify the PriceArea label is correct for Energinet "
-                           "(e.g. DE-LU may be labelled 'DE').", a)
-    return records
+        time.sleep(2.0)
 
 
 def ingest(start: str = DEFAULT_START) -> dict:
-    """Fetch from Energinet and INSERT OR REPLACE into spot_prices."""
+    """
+    Fetch Energinet Elspotprices and INSERT OR REPLACE into spot_prices,
+    committing after EACH page so partial progress survives a rate-limit abort.
+    Idempotent: safe to re-run to top up.
+    """
     init_database()
     logger.info("Fetching Energinet Elspotprices %s → now …", start)
-    records = fetch_energinet(start)
-    if not records:
-        logger.error("No records fetched — nothing inserted.")
-        return {"rows_inserted": 0}
 
     conn = get_connection()
+    cur = conn.cursor()
+    total = 0
+    seen = set()
+    aborted = None
     try:
-        cur = conn.cursor()
-        cur.executemany(
-            "INSERT OR REPLACE INTO spot_prices (hour_utc, price_zone, price_dkk) "
-            "VALUES (?, ?, ?)",
-            records,
-        )
+        for page_no, rows in _iter_pages(start):
+            batch = []
+            for r in rows:
+                area = r.get("PriceArea")
+                zone = AREA_MAP.get(area)
+                if zone is None:
+                    continue
+                p_dkk = r.get("SpotPriceDKK")
+                if p_dkk is None:
+                    p_eur = r.get("SpotPriceEUR")
+                    if p_eur is None:
+                        continue
+                    p_dkk = float(p_eur) * EUR_TO_DKK
+                batch.append((_to_hour_str(r["HourUTC"]), zone, float(p_dkk)))
+                seen.add(area)
+            cur.executemany(
+                "INSERT OR REPLACE INTO spot_prices (hour_utc, price_zone, price_dkk) "
+                "VALUES (?, ?, ?)",
+                batch,
+            )
+            conn.commit()  # persist this page before fetching the next
+            total += len(batch)
+            logger.info("  page %d → %d rows inserted (cumulative %d)",
+                        page_no, len(batch), total)
+    except Exception as exc:
         conn.commit()
+        aborted = exc
+        logger.error("Stopped early: %s", exc)
+        logger.error("Progress saved (%d rows). The API rate-limited this IP — "
+                     "wait a few minutes and simply RE-RUN; it tops up idempotently.",
+                     total)
     finally:
         conn.close()
 
-    # Coverage summary
+    for a in AREA_MAP:
+        if a not in seen:
+            logger.warning("Area %s returned NO data — verify the PriceArea label "
+                           "for Energinet (e.g. DE-LU may be labelled 'DE').", a)
+
     summary = run_query(
         "SELECT price_zone, COUNT(*) n, MIN(hour_utc) lo, MAX(hour_utc) hi "
         "FROM spot_prices GROUP BY price_zone ORDER BY price_zone"
     )
     print("\n📊 spot_prices coverage after ingest:")
     print(summary.to_string(index=False))
-    return {"rows_inserted": len(records)}
+    return {"rows_inserted": total, "aborted": str(aborted) if aborted else None}
 
 
 def check_connectivity() -> bool:
