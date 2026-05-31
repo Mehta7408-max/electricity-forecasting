@@ -143,11 +143,20 @@ def quick_retrain(hidden_channels=128, max_epochs=200, patience=25, warm_start=F
         patience_ctr = 0
         t0 = time.time()
 
+        # DE + HYDRO training mask for the auxiliary reconstruction loss.
+        # These zones now have real prices; predicting them forces the model to
+        # build representations that capture cross-zone price dynamics, which
+        # then propagate back to DK1/DK2 via the co_occurs_with and market edges.
+        de_hydro = ~dk12
+        de_hydro_tr = tr_mask_full & de_hydro
+
         for epoch in range(1, max_epochs + 1):
             model.train()
             optimizer.zero_grad()
-            out  = model(x_dict, ei, num_hours=num_hours).view(-1)
-            loss = F.mse_loss(out[tr_mask], y[tr_mask])
+            out       = model(x_dict, ei, num_hours=num_hours).view(-1)
+            main_loss = F.mse_loss(out[tr_mask], y[tr_mask])
+            aux_loss  = F.mse_loss(out[de_hydro_tr], y[de_hydro_tr])
+            loss      = main_loss + 0.1 * aux_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -247,6 +256,6 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--warm-start", action="store_true")
-    ap.add_argument("--hidden", type=int, default=128)
+    ap.add_argument("--hidden", type=int, default=64)
     args, _ = ap.parse_known_args()
     quick_retrain(hidden_channels=args.hidden, warm_start=args.warm_start)

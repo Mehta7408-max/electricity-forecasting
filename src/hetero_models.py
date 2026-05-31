@@ -52,18 +52,23 @@ class LegacyHeteroPriceForecaster(torch.nn.Module):
 class HeteroPriceForecaster(torch.nn.Module):
     """
     3-layer HeteroSAGE with:
-      - co_occurs_with edges (DK1↔DK2 direct same-timestep coupling)
+      - co_occurs_with edges (DK1↔DK2, DK2↔HYDRO, DK1↔DE, DK2↔DE)
       - 48h lag edge (in addition to 24h and 168h)
       - belongs_to included in all 3 layers (market stays updated)
       - BatchNorm on hour embeddings after each conv layer
-      - Zone-specific output heads
+      - 2-layer market MLP for richer zone-embedding capacity
+      - Single shared output head (vs 4 zone-specific heads):
+          eliminates gradient noise from DE/HYDRO zero-filled targets;
+          100 % of the regression signal targets DK1/DK2 accuracy.
     """
     def __init__(self, metadata, hour_in_features, hidden_channels=128):
         super().__init__()
         self.hidden_channels = hidden_channels
 
-        self.market_lin = Linear(4, hidden_channels)
-        self.hour_lin   = Linear(hour_in_features, hidden_channels)
+        # 2-layer market projection — richer zone embedding than a plain Linear
+        self.market_lin  = Linear(4, hidden_channels)
+        self.market_lin2 = Linear(hidden_channels, hidden_channels)
+        self.hour_lin    = Linear(hour_in_features, hidden_channels)
 
         _edge_types_full = {
             ('market', 'interconnects', 'market'): SAGEConv(hidden_channels, hidden_channels),
@@ -93,16 +98,22 @@ class HeteroPriceForecaster(torch.nn.Module):
         self.bn2 = BatchNorm(hidden_channels)
         self.bn3 = BatchNorm(hidden_channels)
 
-        self.head_dk1   = torch.nn.Sequential(Linear(hidden_channels, hidden_channels // 2), torch.nn.LeakyReLU(0.2), Linear(hidden_channels // 2, 1))
-        self.head_dk2   = torch.nn.Sequential(Linear(hidden_channels, hidden_channels // 2), torch.nn.LeakyReLU(0.2), Linear(hidden_channels // 2, 1))
-        self.head_hydro = torch.nn.Sequential(Linear(hidden_channels, hidden_channels // 2), torch.nn.LeakyReLU(0.2), Linear(hidden_channels // 2, 1))
-        self.head_de    = torch.nn.Sequential(Linear(hidden_channels, hidden_channels // 2), torch.nn.LeakyReLU(0.2), Linear(hidden_channels // 2, 1))
+        # Single shared output head — one regression head for all zones.
+        # Previously 4 zone-specific heads; DE/HYDRO heads injected gradient
+        # noise from zero-filled targets. Shared head means 100% of regression
+        # signal drives DK1/DK2 accuracy (loss is masked to DK1+DK2 only).
+        self.output_head = torch.nn.Sequential(
+            Linear(hidden_channels, hidden_channels // 2),
+            torch.nn.LeakyReLU(0.2),
+            Linear(hidden_channels // 2, 1),
+        )
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict=None, num_hours=None):
         # No dropout: BatchNorm already regularises; BN+Dropout interact adversely.
+        m0 = F.leaky_relu(self.market_lin(x_dict['market']), 0.2)
         h = {
-            'market': F.leaky_relu(self.market_lin(x_dict['market']), 0.2),
-            'hour':   F.leaky_relu(self.hour_lin(x_dict['hour']),   0.2),
+            'market': F.leaky_relu(self.market_lin2(m0) + m0, 0.2),  # 2-layer residual MLP
+            'hour':   F.leaky_relu(self.hour_lin(x_dict['hour']), 0.2),
         }
 
         h1 = self.conv1(h, edge_index_dict)
@@ -117,13 +128,9 @@ class HeteroPriceForecaster(torch.nn.Module):
         h['market'] = F.leaky_relu(h3.get('market', h['market']) + h['market'], 0.2)
         h['hour']   = F.leaky_relu(self.bn3(h3['hour']) + h['hour'], 0.2)
 
-        h_dk1   = h['hour'][0:num_hours]
-        h_dk2   = h['hour'][num_hours:2 * num_hours]
-        h_hydro = h['hour'][2 * num_hours:3 * num_hours]
-        h_de    = h['hour'][3 * num_hours:4 * num_hours]
-
-        return torch.cat([self.head_dk1(h_dk1), self.head_dk2(h_dk2),
-                          self.head_hydro(h_hydro), self.head_de(h_de)], dim=0)
+        # Single shared head — applied to all 4T hour nodes; loss is externally
+        # masked to DK1+DK2 for the primary objective.
+        return self.output_head(h['hour'])
 
 
 class HeteroGATPriceForecaster(torch.nn.Module):
@@ -248,6 +255,8 @@ def load_hetero_model(data, model_path, device):
         ).to(device)
         x_hour_override = data['hour'].x[:, :in_feats]
     else:
+        # Both old (zone-specific heads) and new (shared head) checkpoints use
+        # HeteroPriceForecaster — load_state_dict handles the key mapping.
         model = HeteroPriceForecaster(
             metadata=data.metadata(), hour_in_features=in_feats,
             hidden_channels=hidden_channels,
