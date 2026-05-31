@@ -244,5 +244,9 @@ def quick_retrain(hidden_channels=128, max_epochs=200, patience=25, warm_start=F
 
 
 if __name__ == "__main__":
-    warm = "--warm-start" in sys.argv
-    quick_retrain(warm_start=warm)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--warm-start", action="store_true")
+    ap.add_argument("--hidden", type=int, default=128)
+    args, _ = ap.parse_known_args()
+    quick_retrain(hidden_channels=args.hidden, warm_start=args.warm_start)
