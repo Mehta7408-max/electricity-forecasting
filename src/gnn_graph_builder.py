@@ -52,7 +52,7 @@ class TemporalGraphBuilder:
         # shape: (num_hours, 4)
         cyclic_block = np.stack([hour_sin, hour_cos, dow_sin, dow_cos], axis=1)
 
-        num_features = len(lag_weather_cols) + 4  # 13 total
+        num_features = len(lag_weather_cols) + 4  # 17 total (13 lag/weather/fund + 4 cyclical)
 
         # ── Vectorised feature + target extraction ────────────────────────────
         # zone_offset: 0=DK1, 1=DK2, 2=DE, 3=HYDRO (interleaved layout)
