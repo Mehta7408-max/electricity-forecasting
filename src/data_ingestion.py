@@ -26,7 +26,7 @@ ZONE_MAPPING = {
     "DK1": "DK1",
     "DK2": "DK2",
     "DE": "DE-LU",
-    "HYDRO": "SE4",
+    "HYDRO": "SE3",  # Sweden Zone 3 (SE4 feeds DK, but SE3 is a better hydro proxy)
 }
 
 ENERGY_CHARTS_URL = "https://api.energy-charts.info/price"
