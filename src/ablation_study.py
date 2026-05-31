@@ -23,7 +23,7 @@ from pathlib import Path
 from sklearn.metrics import mean_absolute_error, r2_score
 
 sys.path.insert(0, str(Path(__file__).parent))
-from hetero_config import DEVICE, ARTIFACTS_DIR, GRAPH_DIR
+from hetero_config import DEVICE, ARTIFACTS_DIR, GRAPH_DIR, load_y_scaler, inverse_scale_y
 from hetero_models import load_hetero_model
 
 ZONE_NAMES = ['DK1', 'DK2', 'HYDRO', 'DE']
@@ -36,18 +36,20 @@ def _load():
     data = torch.load(GRAPH_DIR / "hetero_graph.pt", map_location=DEVICE, weights_only=False)
     num_hours = int(data['hour'].num_hours_per_zone)
     model, x_override = load_hetero_model(data, ARTIFACTS_DIR / "best_hetero_model.pt", DEVICE)
-    return model, data, num_hours, x_override
+    y_mean, y_scale = load_y_scaler()
+    return model, data, num_hours, x_override, y_mean, y_scale
 
 
 @torch.no_grad()
-def _eval(model, data, ei_dict, num_hours, x_override=None):
+def _eval(model, data, ei_dict, num_hours, x_override=None, y_mean=0.0, y_scale=1.0):
     """Run inference and return per-zone test metrics."""
     x_dict = {k: v.to(DEVICE) for k, v in data.x_dict.items()}
     if x_override is not None:
         x_dict['hour'] = x_override.to(DEVICE)
-    ei     = {k: v.to(DEVICE) for k, v in ei_dict.items()}
-    out    = model(x_dict, ei, num_hours=num_hours).view(-1).cpu().numpy()
-    y      = data['hour'].y.cpu().numpy()
+    ei          = {k: v.to(DEVICE) for k, v in ei_dict.items()}
+    out_scaled  = model(x_dict, ei, num_hours=num_hours).view(-1).cpu().numpy()
+    out         = inverse_scale_y(out_scaled, y_mean, y_scale)
+    y           = data['hour'].y.cpu().numpy()
     tm     = data['hour'].test_mask.cpu().numpy()
 
     zone_metrics = {}
@@ -76,7 +78,7 @@ def run_ablation_study():
     print("\n🔬 Running Ablation Study (inference-time edge removal)...")
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    model, data, num_hours, x_override = _load()
+    model, data, num_hours, x_override, y_mean, y_scale = _load()
     feat_mode = "legacy (9-feature)" if x_override is not None else "current (13-feature)"
     print(f"   Loaded model: {feat_mode}")
 
@@ -85,30 +87,30 @@ def run_ablation_study():
     results = {}
 
     print("  [A] Full model (baseline)...")
-    results['A_full_model'] = _eval(model, data, base_ei, num_hours, x_override)
+    results['A_full_model'] = _eval(model, data, base_ei, num_hours, x_override, y_mean, y_scale)
 
     print("  [B] No temporal edges (remove lag_to)...")
     ei_b = dict(base_ei)
     ei_b[('hour', 'lag_to', 'hour')] = _DUMMY_EDGE.clone()
-    results['B_no_temporal'] = _eval(model, data, ei_b, num_hours, x_override)
+    results['B_no_temporal'] = _eval(model, data, ei_b, num_hours, x_override, y_mean, y_scale)
 
     print("  [C] No spatial edges (remove interconnects)...")
     ei_c = dict(base_ei)
     ei_c[('market', 'interconnects', 'market')] = _DUMMY_EDGE.clone()
-    results['C_no_spatial'] = _eval(model, data, ei_c, num_hours, x_override)
+    results['C_no_spatial'] = _eval(model, data, ei_c, num_hours, x_override, y_mean, y_scale)
 
     print("  [D] No market aggregation (remove belongs_to + rev_belongs_to)...")
     ei_d = dict(base_ei)
     ei_d[('hour', 'belongs_to', 'market')]     = _DUMMY_EDGE.clone()
     ei_d[('market', 'rev_belongs_to', 'hour')] = _DUMMY_EDGE.clone()
-    results['D_no_market_bridge'] = _eval(model, data, ei_d, num_hours, x_override)
+    results['D_no_market_bridge'] = _eval(model, data, ei_d, num_hours, x_override, y_mean, y_scale)
 
     print("  [E] No market context (spatial + market bridge removed)...")
     ei_e = dict(base_ei)
     ei_e[('market', 'interconnects', 'market')] = _DUMMY_EDGE.clone()
     ei_e[('hour', 'belongs_to', 'market')]       = _DUMMY_EDGE.clone()
     ei_e[('market', 'rev_belongs_to', 'hour')]   = _DUMMY_EDGE.clone()
-    results['E_no_market_context'] = _eval(model, data, ei_e, num_hours, x_override)
+    results['E_no_market_context'] = _eval(model, data, ei_e, num_hours, x_override, y_mean, y_scale)
 
     # ── Compute MAE delta vs full model ──────────────────────────────────────
     base_dk1_mae = results['A_full_model']['DK1']['mae']

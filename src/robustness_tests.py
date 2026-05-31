@@ -21,7 +21,7 @@ from pathlib import Path
 from sklearn.metrics import mean_absolute_error, r2_score
 
 sys.path.insert(0, str(Path(__file__).parent))
-from hetero_config import DEVICE, ARTIFACTS_DIR, GRAPH_DIR
+from hetero_config import DEVICE, ARTIFACTS_DIR, GRAPH_DIR, load_y_scaler, inverse_scale_y
 from hetero_models import load_hetero_model
 
 ZONE_NAMES = ['DK1', 'DK2', 'HYDRO', 'DE']
@@ -33,15 +33,17 @@ def _load():
     num_hours = int(data['hour'].num_hours_per_zone)
     model, x_override = load_hetero_model(data, ARTIFACTS_DIR / "best_hetero_model.pt", DEVICE)
     x_base = (x_override.cpu() if x_override is not None else data['hour'].x).clone()
-    return model, data, num_hours, x_base
+    y_mean, y_scale = load_y_scaler()
+    return model, data, num_hours, x_base, y_mean, y_scale
 
 
 @torch.no_grad()
-def _eval(model, data, x_hour, num_hours):
+def _eval(model, data, x_hour, num_hours, y_mean=0.0, y_scale=1.0):
     x_dict = {k: v.to(DEVICE) for k, v in data.x_dict.items()}
     x_dict['hour'] = x_hour.to(DEVICE)
     ei = {k: v.to(DEVICE) for k, v in data.edge_index_dict.items()}
-    out = model(x_dict, ei, num_hours=num_hours).view(-1).cpu().numpy()
+    out_scaled = model(x_dict, ei, num_hours=num_hours).view(-1).cpu().numpy()
+    out = inverse_scale_y(out_scaled, y_mean, y_scale)
     y   = data['hour'].y.cpu().numpy()
     tm  = data['hour'].test_mask.cpu().numpy()
 
@@ -67,27 +69,27 @@ def _add_delta(results, baseline):
     }
 
 
-def test_gaussian_noise(model, data, num_hours, baseline, x_base,
+def test_gaussian_noise(model, data, num_hours, baseline, x_base, y_mean=0.0, y_scale=1.0,
                         noise_levels=(0.05, 0.10, 0.20, 0.30)):
     feat_std = x_base.std(dim=0).clamp(min=1e-6)
     results = {}
     for sigma in noise_levels:
         x_n = x_base + sigma * feat_std * torch.randn_like(x_base)
-        results[f'noise_{int(sigma*100)}pct'] = _add_delta(_eval(model, data, x_n, num_hours), baseline)
+        results[f'noise_{int(sigma*100)}pct'] = _add_delta(_eval(model, data, x_n, num_hours, y_mean, y_scale), baseline)
     return results
 
 
-def test_feature_dropout(model, data, num_hours, baseline, x_base,
+def test_feature_dropout(model, data, num_hours, baseline, x_base, y_mean=0.0, y_scale=1.0,
                          rates=(0.10, 0.20, 0.30)):
     rng = np.random.default_rng(42)
     results = {}
     for rate in rates:
         mask = torch.tensor(rng.random(x_base.shape) > rate, dtype=torch.float32)
-        results[f'dropout_{int(rate*100)}pct'] = _add_delta(_eval(model, data, x_base * mask, num_hours), baseline)
+        results[f'dropout_{int(rate*100)}pct'] = _add_delta(_eval(model, data, x_base * mask, num_hours, y_mean, y_scale), baseline)
     return results
 
 
-def test_price_spike(model, data, num_hours, baseline, x_base,
+def test_price_spike(model, data, num_hours, baseline, x_base, y_mean=0.0, y_scale=1.0,
                      multipliers=(2.0, 3.0, 5.0)):
     rng = np.random.default_rng(99)
     spike_idx = np.where(rng.random(len(x_base)) < 0.05)[0]
@@ -95,7 +97,7 @@ def test_price_spike(model, data, num_hours, baseline, x_base,
     for mult in multipliers:
         x_s = x_base.clone()
         x_s[spike_idx, :][:, LAG_COLS] *= mult
-        results[f'spike_{int(mult)}x'] = _add_delta(_eval(model, data, x_s, num_hours), baseline)
+        results[f'spike_{int(mult)}x'] = _add_delta(_eval(model, data, x_s, num_hours, y_mean, y_scale), baseline)
     return results
 
 
@@ -103,21 +105,21 @@ def run_robustness_tests():
     print("\n🛡️  Running Robustness Test Suite...")
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    model, data, num_hours, x_base = _load()
+    model, data, num_hours, x_base, y_mean, y_scale = _load()
     n_feats = x_base.shape[1]
     print(f"   Model input features: {n_feats}")
 
     print("  [0/3] Baseline (clean)...")
-    baseline = _eval(model, data, x_base, num_hours)
+    baseline = _eval(model, data, x_base, num_hours, y_mean, y_scale)
 
     print("  [1/3] Gaussian noise injection...")
-    noise_r = test_gaussian_noise(model, data, num_hours, baseline, x_base)
+    noise_r = test_gaussian_noise(model, data, num_hours, baseline, x_base, y_mean, y_scale)
 
     print("  [2/3] Feature dropout...")
-    drop_r = test_feature_dropout(model, data, num_hours, baseline, x_base)
+    drop_r = test_feature_dropout(model, data, num_hours, baseline, x_base, y_mean, y_scale)
 
     print("  [3/3] Price spike simulation...")
-    spike_r = test_price_spike(model, data, num_hours, baseline, x_base)
+    spike_r = test_price_spike(model, data, num_hours, baseline, x_base, y_mean, y_scale)
 
     summary = {
         'baseline': baseline,

@@ -18,7 +18,7 @@ import torch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from hetero_config import DEVICE, ARTIFACTS_DIR, GRAPH_DIR
+from hetero_config import DEVICE, ARTIFACTS_DIR, GRAPH_DIR, load_y_scaler, inverse_scale_y
 from hetero_models import load_hetero_model
 from hetero_pipeline import prepare_multi_area_data
 
@@ -32,7 +32,8 @@ def _load():
     data = torch.load(GRAPH_DIR / "hetero_graph.pt", map_location=DEVICE, weights_only=False)
     num_hours = int(data['hour'].num_hours_per_zone)
     model, x_override = load_hetero_model(data, ARTIFACTS_DIR / "best_hetero_model.pt", DEVICE)
-    return model, data, num_hours, x_override
+    y_mean, y_scale = load_y_scaler()
+    return model, data, num_hours, x_override, y_mean, y_scale
 
 
 def _build_x_dict(data, x_override):
@@ -68,13 +69,14 @@ def compute_feature_importance(model, data, num_hours, x_override):
     return results
 
 
-def compute_error_analysis(model, data, num_hours, x_override):
+def compute_error_analysis(model, data, num_hours, x_override, y_mean=0.0, y_scale=1.0):
     """MAE grouped by hour-of-day and day-of-week for DK1 and DK2."""
     import pandas as pd
     x_dict = _build_x_dict(data, x_override)
     ei = {k: v.to(DEVICE) for k, v in data.edge_index_dict.items()}
     with torch.no_grad():
-        out = model(x_dict, ei, num_hours=num_hours).view(-1).cpu().numpy()
+        out_scaled = model(x_dict, ei, num_hours=num_hours).view(-1).cpu().numpy()
+    out = inverse_scale_y(out_scaled, y_mean, y_scale)
 
     y = data['hour'].y.cpu().numpy()
     test_mask_np = data['hour'].test_mask.cpu().numpy()
@@ -135,7 +137,7 @@ def run_interpretability():
     print("\n🔍 Running Interpretability Analysis...")
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    model, data, num_hours, x_override = _load()
+    model, data, num_hours, x_override, y_mean, y_scale = _load()
     feat_mode = "legacy (9-feature)" if x_override is not None else "current (13-feature)"
     print(f"   Loaded model: {feat_mode}")
 
@@ -143,7 +145,7 @@ def run_interpretability():
     feat_imp = compute_feature_importance(model, data, num_hours, x_override)
 
     print("  [2/3] Error pattern analysis (hour-of-day, day-of-week)...")
-    by_hour, by_dow = compute_error_analysis(model, data, num_hours, x_override)
+    by_hour, by_dow = compute_error_analysis(model, data, num_hours, x_override, y_mean, y_scale)
 
     print("  [3/3] Cross-zone prediction correlations...")
     zone_corr = compute_zone_correlations(model, data, num_hours, x_override)
