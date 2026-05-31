@@ -63,7 +63,8 @@ def build_heterogeneous_spatiotemporal_graph(freeze_scaler=False):
         cols = [
             'price_lag_24h', 'price_lag_48h', 'price_lag_168h',
             'price_rolling_24h_mean', 'price_rolling_24h_std',
-            'temperature_c', 'wind_speed_ms', 'cloud_cover_pct', 'humidity_pct'
+            'temperature_c', 'wind_speed_ms', 'cloud_cover_pct', 'humidity_pct',
+            'load_mwh', 'renewable_mwh', 'gas_dkk', 'co2_dkk'
         ]
         # Return 0 defaults if weather variables aren't present in specific zone views
         for c in cols:

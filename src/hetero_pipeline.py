@@ -69,9 +69,62 @@ def prepare_multi_area_data():
     df_dk2 = _add_autoregressive_features(df_dk2)
     df_de = _add_autoregressive_features(df_de)
     df_hydro = _add_autoregressive_features(df_hydro)
-    
+
+    # 7. Attach fundamentals (demand + renewable generation) and market factors.
+    #    Per-zone load/renewable from zone_fundamentals; global gas/CO2 from
+    #    market_factors broadcast to every zone. Missing (zone,feature) → 0.0.
+    df_dk1 = _attach_fundamentals(df_dk1, 'DK1')
+    df_dk2 = _attach_fundamentals(df_dk2, 'DK2')
+    df_de = _attach_fundamentals(df_de, 'DE')
+    df_hydro = _attach_fundamentals(df_hydro, 'HYDRO')
+
     print(f"   Pipeline successfully returning data frames. Total size: {len(df_dk1)} records.")
     return df_dk1, df_dk2, df_hydro, df_de, df_weather
+
+
+def _attach_fundamentals(df, zone):
+    """Merge per-zone load/renewable and global gas/CO2 onto a zone frame.
+
+    Day-ahead-safe: load/renewable are 'perfect forecast' proxies (like weather);
+    gas/CO2 are slow daily series. All columns default to 0.0 when absent so the
+    feature stays well-defined for zones without a data source (e.g. SE3/HYDRO).
+    """
+    try:
+        zf = run_query(
+            "SELECT hour_utc as timestamp, load_mwh, renewable_mwh "
+            "FROM zone_fundamentals WHERE price_zone=?", params=(zone,)
+        )
+    except Exception:
+        zf = pd.DataFrame(columns=['timestamp', 'load_mwh', 'renewable_mwh'])
+    try:
+        mf = run_query("SELECT hour_utc as timestamp, gas_dkk, co2_dkk FROM market_factors")
+    except Exception:
+        mf = pd.DataFrame(columns=['timestamp', 'gas_dkk', 'co2_dkk'])
+
+    for frame in (zf, mf):
+        if not frame.empty:
+            frame['timestamp'] = pd.to_datetime(frame['timestamp']).dt.strftime('%Y-%m-%d %H:00:00')
+
+    df = df.merge(zf, on='timestamp', how='left') if not zf.empty else df.assign(load_mwh=0.0, renewable_mwh=0.0)
+    df = df.merge(mf, on='timestamp', how='left') if not mf.empty else df.assign(gas_dkk=0.0, co2_dkk=0.0)
+
+    for c in ['load_mwh', 'renewable_mwh', 'gas_dkk', 'co2_dkk']:
+        if c not in df.columns:
+            df[c] = 0.0
+        # ffill slow/again-daily series, then neutral 0.0 for any remaining edges
+        df[c] = df[c].ffill().fillna(0.0)
+
+    # Per-zone z-score for demand/generation so each zone's WITHIN-zone variation
+    # survives the downstream global scaler. Without this, German load (~55 GWh)
+    # would dominate the shared scaler and crush DK's (~2 GWh) variation to noise.
+    # Stats from the first 80% (chronological train split) → day-ahead-safe.
+    n_train = int(len(df) * 0.8)
+    for c in ['load_mwh', 'renewable_mwh']:
+        tr = df[c].iloc[:n_train]
+        mu, sd = tr.mean(), tr.std()
+        if sd and sd > 1e-6:  # skip all-zero zones (no data source)
+            df[c] = (df[c] - mu) / sd
+    return df
 
 def _add_autoregressive_features(df):
     """

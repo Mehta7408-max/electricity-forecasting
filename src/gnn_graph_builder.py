@@ -39,6 +39,7 @@ class TemporalGraphBuilder:
             'price_lag_24h', 'price_lag_48h', 'price_lag_168h',
             'price_rolling_24h_mean', 'price_rolling_24h_std',
             'temperature_c', 'wind_speed_ms', 'cloud_cover_pct', 'humidity_pct',
+            'load_mwh', 'renewable_mwh', 'gas_dkk', 'co2_dkk',
         ]
         # Cyclical time features (same for all zones) — 4 extra columns
         ts = pd.to_datetime(df_dk1['timestamp'])
