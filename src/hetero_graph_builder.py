@@ -154,26 +154,42 @@ def build_heterogeneous_spatiotemporal_graph(freeze_scaler=False):
 
     data['hour', 'lag_to', 'hour'].edge_index = torch.tensor(np.stack([lag_src, lag_dst]), dtype=torch.long)
 
-    # Same-Timestep Cross-Zone Edges (DK1 ↔ DK2).
-    # These allow DK1 and DK2 to exchange embeddings at the same hour, directly
-    # modelling the Great Belt interconnect without routing through the market
-    # abstraction node. Only DK1↔DK2 are connected here because HYDRO and DE
-    # have incomplete price data (zero-fill pre-2023); their cross-zone signal
-    # is handled more coarsely via the market-node hierarchy.
-    t_all = np.arange(num_hours)
-    co_src = np.concatenate([t_all, num_hours + t_all])          # DK1→DK2, DK2→DK1
-    co_dst = np.concatenate([num_hours + t_all, t_all])
+    # Same-Timestep Cross-Zone Edges (expanded physical interconnect topology).
+    # Node offsets: DK1=[0,T), DK2=[T,2T), HYDRO(SE3)=[2T,3T), DE=[3T,4T)
+    #
+    # All zones now carry real price data, so we model every physical link
+    # directly at the hour level instead of routing through the market node:
+    #   DK1 ↔ DK2  : Great Belt HVDC (~1000 MW)
+    #   DK2 ↔ HYDRO: Øresund link to SE3 (~1700 MW)
+    #   DK1 ↔ DE   : Kontek + western cables (~2000 MW)
+    #   DK2 ↔ DE   : Kriegers Flak / Energybridge (~600 MW)
+    t_all  = np.arange(num_hours)
+    dk1, dk2, hyd, de_ = 0, num_hours, 2*num_hours, 3*num_hours
+    co_src = np.concatenate([
+        dk1 + t_all, dk2 + t_all,   # DK1→DK2, DK2→DK1
+        dk2 + t_all, hyd + t_all,   # DK2→HYDRO, HYDRO→DK2
+        dk1 + t_all, de_ + t_all,   # DK1→DE, DE→DK1
+        dk2 + t_all, de_ + t_all,   # DK2→DE, DE→DK2
+    ])
+    co_dst = np.concatenate([
+        dk2 + t_all, dk1 + t_all,
+        hyd + t_all, dk2 + t_all,
+        de_ + t_all, dk1 + t_all,
+        de_ + t_all, dk2 + t_all,
+    ])
     data['hour', 'co_occurs_with', 'hour'].edge_index = torch.tensor(
         np.stack([co_src, co_dst]), dtype=torch.long
     )
 
     # Cross-Border Spatial Grid Interconnects (Market-to-Market Topology)
-    # 0: DK1, 1: DK2, 2: HYDRO, 3: DE
-    inter_src = [0, 1, 0, 3, 0, 2] # Two-way transmission paths
-    inter_dst = [1, 0, 3, 0, 2, 0]
-    
-    # Physical Capacity Weight Matrix (Asymmetric size vectors in Megawatts)
-    inter_weights = [1000.0, 1000.0, 2000.0, 1500.0, 600.0, 600.0]
+    # 0: DK1, 1: DK2, 2: HYDRO(SE3), 3: DE  — all physical cross-border links
+    inter_src = [0, 1, 0, 3, 0, 2, 1, 2, 1, 3]
+    inter_dst = [1, 0, 3, 0, 2, 0, 2, 1, 3, 1]
+
+    # Physical capacity weights (MW): Great Belt, Kontek, DK1-HYDRO,
+    # Øresund, Kriegers Flak/Energybridge
+    inter_weights = [1000.0, 1000.0, 2000.0, 1500.0, 600.0, 600.0,
+                     1700.0, 1700.0, 600.0, 600.0]
     
     data['market', 'interconnects', 'market'].edge_index = torch.tensor([inter_src, inter_dst], dtype=torch.long)
     data['market', 'interconnects', 'market'].edge_attr = torch.tensor(inter_weights, dtype=torch.float32).view(-1, 1)
