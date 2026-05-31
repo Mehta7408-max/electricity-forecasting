@@ -99,7 +99,7 @@ class HeteroPriceForecaster(torch.nn.Module):
         self.head_de    = torch.nn.Sequential(Linear(hidden_channels, hidden_channels // 2), torch.nn.LeakyReLU(0.2), Linear(hidden_channels // 2, 1))
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict=None, num_hours=None):
-        dropout = 0.2
+        # No dropout: BatchNorm already regularises; BN+Dropout interact adversely.
         h = {
             'market': F.leaky_relu(self.market_lin(x_dict['market']), 0.2),
             'hour':   F.leaky_relu(self.hour_lin(x_dict['hour']),   0.2),
@@ -107,15 +107,15 @@ class HeteroPriceForecaster(torch.nn.Module):
 
         h1 = self.conv1(h, edge_index_dict)
         h['market'] = F.leaky_relu(h1['market'] + h['market'], 0.2)
-        h['hour']   = F.dropout(F.leaky_relu(self.bn1(h1['hour']) + h['hour'], 0.2), p=dropout, training=self.training)
+        h['hour']   = F.leaky_relu(self.bn1(h1['hour']) + h['hour'], 0.2)
 
         h2 = self.conv2(h, edge_index_dict)
         h['market'] = F.leaky_relu(h2['market'] + h['market'], 0.2)
-        h['hour']   = F.dropout(F.leaky_relu(self.bn2(h2['hour']) + h['hour'], 0.2), p=dropout, training=self.training)
+        h['hour']   = F.leaky_relu(self.bn2(h2['hour']) + h['hour'], 0.2)
 
         h3 = self.conv3(h, edge_index_dict)
         h['market'] = F.leaky_relu(h3.get('market', h['market']) + h['market'], 0.2)
-        h['hour']   = F.dropout(F.leaky_relu(self.bn3(h3['hour']) + h['hour'], 0.2), p=dropout, training=self.training)
+        h['hour']   = F.leaky_relu(self.bn3(h3['hour']) + h['hour'], 0.2)
 
         h_dk1   = h['hour'][0:num_hours]
         h_dk2   = h['hour'][num_hours:2 * num_hours]
