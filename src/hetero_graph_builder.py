@@ -154,28 +154,27 @@ def build_heterogeneous_spatiotemporal_graph(freeze_scaler=False):
 
     data['hour', 'lag_to', 'hour'].edge_index = torch.tensor(np.stack([lag_src, lag_dst]), dtype=torch.long)
 
-    # Same-Timestep Cross-Zone Edges (expanded physical interconnect topology).
+    # Same-Timestep Cross-Zone Edges (physical interconnect topology).
     # Node offsets: DK1=[0,T), DK2=[T,2T), HYDRO(SE3)=[2T,3T), DE=[3T,4T)
     #
-    # All zones now carry real price data, so we model every physical link
-    # directly at the hour level instead of routing through the market node:
+    # We connect ONLY full-coverage zones at the hour level:
     #   DK1 ↔ DK2  : Great Belt HVDC (~1000 MW)
     #   DK2 ↔ HYDRO: Øresund link to SE3 (~1700 MW)
-    #   DK1 ↔ DE   : Kontek + western cables (~2000 MW)
-    #   DK2 ↔ DE   : Kriegers Flak / Energybridge (~600 MW)
+    # DE is deliberately EXCLUDED from hour-level co_occurs_with edges: its
+    # price series ends 2024-12-31 and is forward-filled with a stale constant
+    # across 2025 — which is exactly the val/test window. Wiring DE directly to
+    # DK1/DK2 here would inject that stale value straight into the evaluation
+    # predictions. DE still participates more coarsely via the market node,
+    # where the model can learn to down-weight it.
     t_all  = np.arange(num_hours)
-    dk1, dk2, hyd, de_ = 0, num_hours, 2*num_hours, 3*num_hours
+    dk1, dk2, hyd = 0, num_hours, 2 * num_hours
     co_src = np.concatenate([
         dk1 + t_all, dk2 + t_all,   # DK1→DK2, DK2→DK1
         dk2 + t_all, hyd + t_all,   # DK2→HYDRO, HYDRO→DK2
-        dk1 + t_all, de_ + t_all,   # DK1→DE, DE→DK1
-        dk2 + t_all, de_ + t_all,   # DK2→DE, DE→DK2
     ])
     co_dst = np.concatenate([
         dk2 + t_all, dk1 + t_all,
         hyd + t_all, dk2 + t_all,
-        de_ + t_all, dk1 + t_all,
-        de_ + t_all, dk2 + t_all,
     ])
     data['hour', 'co_occurs_with', 'hour'].edge_index = torch.tensor(
         np.stack([co_src, co_dst]), dtype=torch.long
