@@ -256,6 +256,6 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--warm-start", action="store_true")
-    ap.add_argument("--hidden", type=int, default=64)
+    ap.add_argument("--hidden", type=int, default=128)
     args, _ = ap.parse_known_args()
     quick_retrain(hidden_channels=args.hidden, warm_start=args.warm_start)
