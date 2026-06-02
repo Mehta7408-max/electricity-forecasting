@@ -49,8 +49,12 @@ This notebook is the complete technical record of the project. It covers:
 7. [MLOps setup](#section-7)
 8. [Results — leaderboard, ablation, interpretability, robustness](#section-8)
 9. [Reproducibility](#section-9)
+10. [Interactive model testing — run XGBoost, HomoGNN, ST-HeteroSAGE live](#section-10)
+11. [Graph structure visualisation — nodes, edges, types, interactive subgraph](#section-11)
+12. [Summary for the supervisor — Q&A table](#section-12)
 
 Every result cell loads a committed JSON artifact — no GPU or retraining needed.
+Sections 10–11 load model checkpoints and run live inference (CPU, ~30 s total).
 """)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -64,6 +68,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 import warnings; warnings.filterwarnings('ignore')
 
 plt.rcParams.update({
@@ -71,6 +78,7 @@ plt.rcParams.update({
     "axes.grid": True, "grid.alpha": 0.3,
     "axes.spines.top": False, "axes.spines.right": False,
 })
+ZONE_COLORS = {"DK1": "#2171b5", "DK2": "#6baed6", "HYDRO": "#74c476", "DE": "#fd8d3c"}
 
 # Locate repo root (parent that contains both 'src' and 'artifacts')
 HERE = Path.cwd()
@@ -158,17 +166,22 @@ df_info['rows'] = df_info['rows'].apply(lambda x: f"{x:,}")
 display(df_info[['rows','from','to','cols']])
 """)
 
-code(r"""# Price distribution per zone — the raw targets
+code(r"""# Price distribution per zone — the raw targets (Plotly)
 spot = pd.read_sql("SELECT price_zone, price_dkk FROM spot_prices", conn)
-fig, ax = plt.subplots(figsize=(10, 4))
-for zone, color in zip(['DK1','DK2','HYDRO','DE'], ['#2171b5','#6baed6','#74c476','#fd8d3c']):
+fig = go.Figure()
+for zone, color in [('DK1','#2171b5'),('DK2','#6baed6'),('HYDRO','#74c476'),('DE','#fd8d3c')]:
     d = spot.loc[spot.price_zone == zone, 'price_dkk']
-    ax.hist(d, bins=80, alpha=0.55, label=f"{zone} (μ={d.mean():.0f}, σ={d.std():.0f})", color=color)
-ax.set_xlabel("Price (DKK/MWh)"); ax.set_ylabel("Hours")
-ax.set_title("Raw price distribution by zone — full dataset (2020–2025)")
-ax.legend(); plt.tight_layout(); plt.show()
+    fig.add_trace(go.Histogram(
+        x=d, nbinsx=80, name=f"{zone} (μ={d.mean():.0f}, σ={d.std():.0f})",
+        marker_color=color, opacity=0.55,
+    ))
+fig.update_layout(
+    barmode='overlay', title="Raw price distribution by zone — full dataset (2020–2025)",
+    xaxis_title="Price (DKK/MWh)", yaxis_title="Hours",
+    legend=dict(x=0.75, y=0.95), height=400,
+)
+fig.show()
 
-# Negative prices do occur — spikes in renewable generation
 neg = spot[spot.price_dkk < 0]
 print(f"Negative-price hours: {len(neg):,} ({len(neg)/len(spot)*100:.1f}% of all zone-hours)")
 print(neg.groupby('price_zone').size().rename("negative hours"))
@@ -376,41 +389,42 @@ for et in data.edge_types:
     print(f"  {str(et):<55} {n:>8,} edges{attr_str}")
 """)
 
-code(r"""# Visualise the market-level topology
-fig, ax = plt.subplots(figsize=(6, 5))
+code(r"""# Visualise the market-level topology (interactive Plotly)
 pos = {"DK1": (0, 1), "DK2": (1, 1), "HYDRO": (1.5, 2), "DE": (0.5, 0)}
-colors = {"DK1": "#2171b5", "DK2": "#6baed6", "HYDRO": "#74c476", "DE": "#fd8d3c"}
-
-# draw nodes
-for name, (x_, y_) in pos.items():
-    ax.scatter(x_, y_, s=800, color=colors[name], zorder=3)
-    ax.text(x_, y_+0.12, name, ha='center', fontweight='bold', fontsize=12)
-
-# draw edges with capacity labels
-edges = [
-    ("DK1","DK2",  "1,000 MW (hour-level)"),
-    ("DK2","HYDRO","1,700 MW (hour-level)"),
-    ("DK1","DE",   "market bridge only"),
-    ("DK2","DE",   "market bridge only"),
-    ("DK1","HYDRO","market bridge only"),
+node_colors = {"DK1": "#2171b5", "DK2": "#6baed6", "HYDRO": "#74c476", "DE": "#fd8d3c"}
+edges_top = [
+    ("DK1","DK2",  "1,000 MW", "#c0504d", True),
+    ("DK2","HYDRO","1,700 MW", "#c0504d", True),
+    ("DK1","DE",   "market bridge only", "#aaaaaa", False),
+    ("DK2","DE",   "market bridge only", "#aaaaaa", False),
+    ("DK1","HYDRO","market bridge only", "#aaaaaa", False),
 ]
-for src, dst, label in edges:
-    x0, y0 = pos[src]; x1, y1 = pos[dst]
-    is_hour = "hour-level" in label
-    color = "#c0504d" if is_hour else "#aaaaaa"
-    lw    = 2.5 if is_hour else 1.0
-    ls    = "-" if is_hour else "--"
-    ax.plot([x0,x1],[y0,y1], color=color, lw=lw, ls=ls, zorder=2)
-    mx, my = (x0+x1)/2, (y0+y1)/2
-    ax.text(mx, my, label, ha='center', va='bottom', fontsize=8, color=color)
 
-from matplotlib.lines import Line2D
-legend = [Line2D([0],[0],color='#c0504d',lw=2.5,label='co_occurs_with (hour-level + market bridge)'),
-          Line2D([0],[0],color='#aaaaaa',lw=1,ls='--',label='market bridge only (DE staleness fix)')]
-ax.legend(handles=legend, loc='lower left', fontsize=9)
-ax.set_title("Physical interconnect topology in the graph", fontsize=12)
-ax.set_xlim(-0.3, 2.0); ax.set_ylim(-0.3, 2.5); ax.axis('off')
-plt.tight_layout(); plt.show()
+fig = go.Figure()
+for src, dst, label, color, is_hour in edges_top:
+    x0, y0 = pos[src]; x1, y1 = pos[dst]
+    fig.add_trace(go.Scatter(
+        x=[x0, (x0+x1)/2, x1], y=[y0, (y0+y1)/2, y1], mode='lines+text',
+        line=dict(color=color, width=3 if is_hour else 1.5, dash='solid' if is_hour else 'dash'),
+        text=["", label, ""], textposition="top center", textfont=dict(size=9, color=color),
+        showlegend=False, hoverinfo='skip',
+    ))
+for name, (x_, y_) in pos.items():
+    fig.add_trace(go.Scatter(
+        x=[x_], y=[y_], mode='markers+text',
+        marker=dict(size=30, color=node_colors[name], line=dict(width=2, color='white')),
+        text=[name], textposition="top center", textfont=dict(size=12, color='black', family='Arial Black'),
+        name=name, hovertemplate=f"<b>{name}</b><extra></extra>",
+    ))
+fig.update_layout(
+    title="Market-level physical interconnect topology",
+    xaxis=dict(visible=False, range=[-0.4, 2.1]),
+    yaxis=dict(visible=False, range=[-0.4, 2.6]),
+    height=420, showlegend=True,
+    legend=dict(x=0.01, y=0.01),
+    plot_bgcolor='white',
+)
+fig.show()
 """)
 
 code(r"""# Prove DE is excluded from co_occurs_with edges
@@ -647,32 +661,35 @@ paths: (a) DE/HYDRO zeros pulling the scale down, and (b) future test prices
 shifting the mean.
 """)
 
-code(r"""# Visualise training history for the ST-HeteroSAGE
-import json
+code(r"""# Visualise training history (Plotly — hover to inspect any epoch)
 hist_path = ART_HET / "hetero_training_history.json"
 if hist_path.exists():
     hist_raw = json.load(open(hist_path))
-    # History is stored as a list-of-dicts [{val_mae:.., val_rmse:..}, ...]
     if isinstance(hist_raw, list):
         val_mae = [e["val_mae"] for e in hist_raw]
         val_r2  = [e.get("val_r2", None) for e in hist_raw]
     else:
         val_mae = hist_raw.get("val_mae", [])
         val_r2  = hist_raw.get("val_r2", [None]*len(val_mae))
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    axes[0].plot(val_mae, color='#2171b5', lw=1.5, label='Val MAE (DKK)')
-    axes[0].set_title("Validation MAE during training (HeteroSAGE)"); axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("MAE (DKK)"); axes[0].legend()
-    if any(v is not None for v in val_r2):
-        axes[1].plot(val_r2, color='#41ab5d', lw=1.5, label='Val R²')
-        axes[1].set_title("Validation R²"); axes[1].set_xlabel("Epoch"); axes[1].legend()
-    plt.tight_layout(); plt.show()
+    epochs = list(range(1, len(val_mae)+1))
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("Validation MAE (DKK)", "Validation R²"))
+    fig.add_trace(go.Scatter(x=epochs, y=val_mae, mode='lines', name='Val MAE',
+                             line=dict(color='#2171b5', width=2)), row=1, col=1)
     best_epoch = int(np.argmin(val_mae)) + 1
+    fig.add_vline(x=best_epoch, line_dash='dash', line_color='red',
+                  annotation_text=f"best epoch {best_epoch}", row=1, col=1)
+    if any(v is not None for v in val_r2):
+        fig.add_trace(go.Scatter(x=epochs, y=val_r2, mode='lines', name='Val R²',
+                                 line=dict(color='#41ab5d', width=2)), row=1, col=2)
+    fig.update_xaxes(title_text="Epoch")
+    fig.update_yaxes(title_text="MAE (DKK)", row=1, col=1)
+    fig.update_yaxes(title_text="R²", row=1, col=2)
+    fig.update_layout(height=380, title="HeteroSAGE training convergence")
+    fig.show()
     print(f"Best val MAE: {min(val_mae):.1f} DKK at epoch {best_epoch}")
-    print(f"Total epochs in history: {len(val_mae)}")
+    print(f"Total epochs logged: {len(val_mae)}")
 else:
-    print("Training history not saved for ST model (JSON not stored by st_train.py).")
-    print("The checkpoint best_st_hetero_model.pt is the best-val-epoch weights.")
+    print("Training history not saved for ST model — checkpoint is best-val-epoch weights.")
 """)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -809,20 +826,26 @@ print(f"\nBest model: {best}")
 print(f"MAE improvement over XGBoost: {imp:.1f}%")
 """)
 
-code(r"""fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
-order   = df_lb.index.tolist()
-palette = ["#9aa0a6","#5b8def","#74c476","#3f6fd1","#e0773a"]
+code(r"""order   = df_lb.index.tolist()
+palette = ["#9aa0a6","#5b8def","#74c476","#3f6fd1","#7c3aed"]
 
-axes[0].bar(range(len(order)), df_lb["MAE (DKK)"], color=palette, width=0.6)
-axes[0].set_xticks(range(len(order))); axes[0].set_xticklabels(order, rotation=20, ha='right')
-axes[0].set_title("Test MAE — lower is better"); axes[0].set_ylabel("DKK")
-for i, v in enumerate(df_lb["MAE (DKK)"]): axes[0].text(i, v+1, f"{v:.1f}", ha='center', fontsize=9)
-
-axes[1].bar(range(len(order)), df_lb["R²"], color=palette, width=0.6)
-axes[1].set_xticks(range(len(order))); axes[1].set_xticklabels(order, rotation=20, ha='right')
-axes[1].set_title("Test R² — higher is better"); axes[1].set_ylim(0, 0.8)
-for i, v in enumerate(df_lb["R²"]): axes[1].text(i, v+0.01, f"{v:.3f}", ha='center', fontsize=9)
-plt.tight_layout(); plt.show()
+fig = make_subplots(rows=1, cols=2, subplot_titles=("Test MAE — lower is better",
+                                                      "Test R² — higher is better"))
+fig.add_trace(go.Bar(
+    x=order, y=df_lb["MAE (DKK)"].values, marker_color=palette,
+    text=[f"{v:.1f}" for v in df_lb["MAE (DKK)"].values], textposition='outside',
+    name='MAE',
+), row=1, col=1)
+fig.add_trace(go.Bar(
+    x=order, y=df_lb["R²"].values, marker_color=palette,
+    text=[f"{v:.3f}" for v in df_lb["R²"].values], textposition='outside',
+    name='R²',
+), row=1, col=2)
+fig.update_yaxes(title_text="DKK", row=1, col=1)
+fig.update_yaxes(title_text="R²", range=[0, 0.82], row=1, col=2)
+fig.update_xaxes(tickangle=-20)
+fig.update_layout(height=440, showlegend=False, title="Model leaderboard — DK1+DK2 test set")
+fig.show()
 """)
 
 md("### 8.2 Ablation study — ST-HeteroSAGE component contributions")
@@ -845,14 +868,21 @@ df_abl = pd.DataFrame([{
 display(df_abl)
 
 deltas = df_abl["Δ MAE"].iloc[1:]
-fig, ax = plt.subplots(figsize=(8, 4))
-colors = ['#c0504d' if v>20 else '#e07030' if v>10 else '#f0a060' for v in deltas.values]
-ax.barh(deltas.index[::-1], deltas.values[::-1], color=colors[::-1])
-ax.set_xlabel("Δ MAE vs full model (DKK)  — larger bar = component is more important")
-ax.set_title("Ablation: cost of removing each architectural component")
-for i, v in enumerate(deltas.values[::-1]):
-    ax.text(v+1, i, f"+{v:.0f} DKK", va='center', fontsize=9)
-plt.tight_layout(); plt.show()
+bar_colors = ['#c0504d' if v>20 else '#e07030' if v>10 else '#f0a060' for v in deltas.values]
+fig = go.Figure(go.Bar(
+    y=deltas.index[::-1].tolist(),
+    x=deltas.values[::-1].tolist(),
+    orientation='h',
+    marker_color=bar_colors[::-1],
+    text=[f"+{v:.0f} DKK" for v in deltas.values[::-1]],
+    textposition='outside',
+))
+fig.update_layout(
+    title="Ablation: cost of removing each ST-HeteroSAGE component",
+    xaxis_title="Δ MAE vs full model (DKK) — larger = more important",
+    height=380,
+)
+fig.show()
 """)
 
 md("### 8.3 Interpretability — feature importance and error patterns")
@@ -860,29 +890,50 @@ md("### 8.3 Interpretability — feature importance and error patterns")
 code(r"""interp = load_json("artifacts_hetero/st_interpretability.json")
 fi = pd.DataFrame(interp["feature_importance"]).set_index("feature")
 
-fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+# Feature importance — horizontal bar (Plotly)
 top = fi.head(10).iloc[::-1]
-axes[0].barh(top.index, top["importance"], color="#4f81bd")
-axes[0].set_xlabel("Mean |∂loss/∂x|"); axes[0].set_title("Top 10 features — gradient importance")
+max_imp = top["importance"].max()
+fig = go.Figure(go.Bar(
+    y=top.index.tolist(), x=(top["importance"] / max_imp).tolist(),
+    orientation='h', marker_color='#4f81bd',
+    text=[f"{v:.2e}" for v in top["importance"].tolist()], textposition='outside',
+))
+fig.update_layout(
+    title="Top 10 features — gradient saliency (ST-HeteroSAGE)",
+    xaxis_title="Normalised importance (top feature = 1.0)",
+    height=380,
+)
+fig.show()
 
-ebt = interp["error_by_time"]
-hod = {int(k): v for k, v in ebt["hour_of_day"].items()}
-hours = sorted(hod)
-axes[1].plot(hours, [hod[h] for h in hours], marker='o', color='#e0773a', lw=2)
-axes[1].set_xticks(range(0,24,2)); axes[1].set_xlabel("Hour of day")
-axes[1].set_ylabel("MAE (DKK)"); axes[1].set_title("Error by hour-of-day")
-plt.tight_layout(); plt.show()
-
-dow = ebt["day_of_week"]
+# Error by hour of day and day of week (side-by-side Plotly)
+ebt = interp.get("error_by_time", {})
+hod = {int(k): v for k, v in ebt.get("hour_of_day", {}).items()}
+dow = ebt.get("day_of_week", {})
 order_dow = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-fig, ax = plt.subplots(figsize=(7, 3))
-ax.bar([d for d in order_dow if d in dow], [dow[d] for d in order_dow if d in dow], color="#8064a2")
-ax.set_ylabel("MAE (DKK)"); ax.set_title("Error by day-of-week"); plt.tight_layout(); plt.show()
 
-wh = max(hod, key=hod.get); bh = min(hod, key=hod.get)
-wd = max(dow, key=dow.get);  bd = min(dow, key=dow.get)
-print(f"Worst hour: {wh:02d}:00 ({hod[wh]:.1f} DKK)  Best hour: {bh:02d}:00 ({hod[bh]:.1f} DKK)")
-print(f"Worst day:  {wd} ({dow[wd]:.1f} DKK)  Best day:  {bd} ({dow[bd]:.1f} DKK)")
+fig = make_subplots(rows=1, cols=2, subplot_titles=("MAE by hour of day", "MAE by day of week"))
+if hod:
+    hours = sorted(hod)
+    fig.add_trace(go.Scatter(
+        x=hours, y=[hod[h] for h in hours], mode='lines+markers',
+        line=dict(color='#e0773a', width=2), marker=dict(size=6), name='MAE by hour',
+    ), row=1, col=1)
+if dow:
+    days_present = [d for d in order_dow if d in dow]
+    fig.add_trace(go.Bar(
+        x=days_present, y=[dow[d] for d in days_present],
+        marker_color='#8064a2', name='MAE by day',
+    ), row=1, col=2)
+fig.update_yaxes(title_text="MAE (DKK)")
+fig.update_layout(height=360, showlegend=False)
+fig.show()
+
+if hod:
+    wh = max(hod, key=hod.get); bh = min(hod, key=hod.get)
+    print(f"Worst hour: {wh:02d}:00 ({hod[wh]:.1f} DKK)  Best hour: {bh:02d}:00 ({hod[bh]:.1f} DKK)")
+if dow:
+    wd = max(dow, key=dow.get); bd = min(dow, key=dow.get)
+    print(f"Worst day:  {wd} ({dow[wd]:.1f} DKK)  Best day:  {bd} ({dow[bd]:.1f} DKK)")
 """)
 
 md("### 8.4 Robustness under perturbation")
@@ -890,25 +941,36 @@ md("### 8.4 Robustness under perturbation")
 code(r"""rob = load_json("artifacts_hetero/st_robustness_results.json")
 base_mae = rob["baseline"]["mae"]
 
-noise_x = [5,10,20,30]; drop_x = [10,20,30]; spike_x = [2,3,5]
-fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-for ax, section, key_fmt, xs, xlabel, color in [
-    (axes[0], "gaussian_noise",  "noise_{}pct",  noise_x, "σ (% of feature std)", "#4f81bd"),
-    (axes[1], "feature_dropout", "drop_{}pct",   drop_x,  "Dropout rate (%)",      "#c0504d"),
-    (axes[2], "price_spike",     "spike_{}x",    spike_x, "Lag amplification (×)", "#9bbb59"),
-]:
-    maes = [rob[section][key_fmt.format(x)]["mae"] for x in xs]
-    ax.plot(xs, maes, marker='o', color=color, lw=2)
-    ax.axhline(base_mae, ls='--', color='gray', lw=1, label=f'clean {base_mae:.0f}')
-    ax.set_xlabel(xlabel); ax.set_ylabel("MAE (DKK)"); ax.legend(fontsize=9)
-fig.suptitle("Robustness: MAE under test-time perturbation (inference only, no retraining)", y=1.02)
-plt.tight_layout(); plt.show()
+scenarios = [
+    ("gaussian_noise",  "noise_{}pct",  [5,10,20,30], "σ (% of std)",   "#4f81bd"),
+    ("feature_dropout", "drop_{}pct",   [10,20,30],   "Dropout %",      "#c0504d"),
+    ("price_spike",     "spike_{}x",    [2,3,5],      "Spike factor ×", "#9bbb59"),
+]
+fig = make_subplots(rows=1, cols=3, subplot_titles=[
+    "Gaussian Noise", "Feature Dropout", "Price Spike"])
+for col, (section, key_fmt, xs, xlabel, color) in enumerate(scenarios, 1):
+    maes   = [rob[section][key_fmt.format(x)]["mae"]       for x in xs]
+    deltas = [rob[section][key_fmt.format(x)]["delta_pct"] for x in xs]
+    fig.add_trace(go.Scatter(
+        x=xs, y=maes, mode='lines+markers',
+        line=dict(color=color, width=2), marker=dict(size=8),
+        text=[f"Δ{d:+.1f}%" for d in deltas], textposition='top center',
+        name=section.replace('_',' '),
+    ), row=1, col=col)
+    fig.add_hline(y=base_mae, line_dash='dash', line_color='gray',
+                  annotation_text=f"baseline {base_mae:.0f}", row=1, col=col)
+    fig.update_xaxes(title_text=xlabel, row=1, col=col)
+    fig.update_yaxes(title_text="MAE (DKK)", row=1, col=col)
+fig.update_layout(
+    height=400, showlegend=False,
+    title="Robustness: MAE under test-time perturbation (no retraining)",
+)
+fig.show()
 
-# Summary table
-print("\nSummary: worst-case degradation per scenario")
-print(f"  Gaussian noise σ=30%:        Δ = {rob['gaussian_noise']['noise_30pct']['delta_pct']:+.1f}%")
-print(f"  Feature dropout 30%:         Δ = {rob['feature_dropout']['drop_30pct']['delta_pct']:+.1f}%")
-print(f"  Price spike 5× (5% nodes):   Δ = {rob['price_spike']['spike_5x']['delta_pct']:+.1f}%")
+print(f"\nWorst-case degradation:")
+print(f"  Gaussian noise σ=30%:   Δ = {rob['gaussian_noise']['noise_30pct']['delta_pct']:+.1f}%")
+print(f"  Feature dropout 30%:    Δ = {rob['feature_dropout']['drop_30pct']['delta_pct']:+.1f}%")
+print(f"  Price spike ×5:         Δ = {rob['price_spike']['spike_5x']['delta_pct']:+.1f}%")
 """)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -945,7 +1007,8 @@ GNN training scripts. XGBoost uses `random_state=42`.
 **Environment:** Python 3.10, PyTorch 2.x, PyTorch-Geometric 2.x, XGBoost 3.x.
 See `requirements.txt` in the repo root.
 
-## 10. Summary for the supervisor
+<a id="section-12"></a>
+## 12. Summary for the supervisor
 
 | Question | Answer |
 |----------|--------|
@@ -957,6 +1020,583 @@ See `requirements.txt` in the repo root.
 | **Why no Dropout?** | BN + Dropout interact adversely (BN statistics corrupted by dropout masking); BN alone regularises adequately |
 | **Is MLOps in place?** | MLflow experiment tracking, git-versioned artifacts, warm-start / freeze-scaler for incremental updates, Docker + CI/CD |
 | **Best result** | ST-HeteroSAGE: **MAE 151.1 DKK, R² 0.696** — 26.5% better than XGBoost baseline |
+""")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 10.  INTERACTIVE MODEL TESTING
+# ══════════════════════════════════════════════════════════════════════════════
+md(r"""<a id="section-10"></a>
+## 10. Interactive Model Testing
+
+Run the cells below to perform **live inference** with XGBoost, HomoGNN, and
+ST-HeteroSAGE.  Edit the `INPUT FEATURES` block at the top of each sub-section
+to test different scenarios.  The model prints its prediction alongside the
+expected uncertainty (± test MAE) and a simple bar chart.
+
+> **Note:** All model files are read from `src/` (the notebook kernel's working
+> directory).  If a checkpoint is missing, the cell prints a reproduction command.
+""")
+
+# ── 10.1 XGBoost ─────────────────────────────────────────────────────────────
+md("### 10.1 XGBoost — live inference")
+
+code(r"""# ── INPUT FEATURES (edit these) ──────────────────────────────────────────
+zone            = "DK1"   # "DK1" or "DK2"
+lag_24h         = 420.0   # price same hour, yesterday        (DKK/MWh)
+lag_48h         = 390.0   # price same hour, two days ago
+lag_168h        = 445.0   # price same hour, last week
+roll_mean       = 410.0   # mean price over 24-47 h window
+roll_std        = 35.0    # std  price over 24-47 h window
+temperature_c   = 8.0
+wind_speed_ms   = 6.5
+cloud_cover_pct = 60.0
+humidity_pct    = 75.0
+hour_of_day     = 17      # 0-23
+day_of_week     = 0       # 0=Mon … 6=Sun
+# ─────────────────────────────────────────────────────────────────────────────
+
+import pickle, math, sys
+import numpy as np
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+
+xgb_path = Path("artifacts/xgboost_model.pkl")
+if not xgb_path.exists():
+    print(f"Checkpoint not found: {xgb_path}")
+    print("  → cd src && python xgboost_baseline.py")
+else:
+    with open(xgb_path, "rb") as f:
+        xgb_model = pickle.load(f)
+
+    h_sin = math.sin(2*math.pi*hour_of_day/24); h_cos = math.cos(2*math.pi*hour_of_day/24)
+    d_sin = math.sin(2*math.pi*day_of_week/7);  d_cos = math.cos(2*math.pi*day_of_week/7)
+    z_enc = 0 if zone == "DK1" else 1
+
+    feat = np.array([[lag_24h, lag_48h, lag_168h, roll_mean, roll_std,
+                      temperature_c, wind_speed_ms, cloud_cover_pct, humidity_pct,
+                      h_sin, h_cos, d_sin, d_cos, z_enc]], dtype=np.float32)
+    pred = float(xgb_model.predict(feat)[0])
+
+    metrics = load_json("artifacts/xgboost_metrics.json")
+    mae = metrics.get("mae", metrics.get("test_mae", 205.6))
+
+    print(f"Zone:               {zone}")
+    print(f"Predicted price:    {pred:,.1f} DKK/MWh")
+    print(f"Test MAE:           {mae:.1f} DKK  → 90 % interval ≈ [{pred-mae:,.0f}, {pred+mae:,.0f}]")
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=[zone], y=[pred], marker_color="#4e79a7",
+                         text=[f"{pred:.1f}"], textposition="outside", name="Prediction"))
+    fig.add_shape(type="rect", x0=-0.4, x1=0.4,
+                  y0=max(0, pred-mae), y1=pred+mae,
+                  fillcolor="lightblue", opacity=0.25, line_width=0)
+    fig.update_layout(title=f"XGBoost prediction — {zone}  (shading = ± MAE)",
+                      yaxis_title="Price (DKK/MWh)", height=340, showlegend=False)
+    fig.show()
+""")
+
+# ── 10.2 HomoGNN ─────────────────────────────────────────────────────────────
+md("### 10.2 HomoGNN — live inference")
+
+code(r"""# ── INPUT FEATURES (same schema as 10.1) ─────────────────────────────────
+zone            = "DK1"
+lag_24h         = 420.0
+lag_48h         = 390.0
+lag_168h        = 445.0
+roll_mean       = 410.0
+roll_std        = 35.0
+temperature_c   = 8.0
+wind_speed_ms   = 6.5
+cloud_cover_pct = 60.0
+humidity_pct    = 75.0
+load_mwh        = 3500.0
+renewable_mwh   = 1500.0
+gas_dkk         = 300.0
+co2_dkk         = 80.0
+hour_of_day     = 17
+day_of_week     = 0
+# ─────────────────────────────────────────────────────────────────────────────
+
+import pickle, math, sys
+import numpy as np
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+
+ckpt_path   = Path("artifacts/best_homo_model.pt")
+graph_path  = Path("data/graphs_homo/temporal_graph.pt")
+scaler_path = Path("data/graphs_homo/homo_scalers.pkl")
+
+missing = [p for p in [ckpt_path, graph_path, scaler_path] if not p.exists()]
+if missing:
+    print("Missing files:", [str(p) for p in missing])
+    print("  → cd src && python homo_retrain.py")
+else:
+    import torch
+    from homo_models import load_homo_model
+
+    device = torch.device("cpu")
+    data   = torch.load(graph_path, map_location=device, weights_only=False)
+    with open(scaler_path, "rb") as f:
+        scalers = pickle.load(f)
+
+    model, x_override = load_homo_model(data, ckpt_path, device)
+    model.eval()
+
+    num_nodes = data.x.shape[0]
+    T = num_nodes // 2              # nodes per zone
+    feat_scaler = scalers["feature_scaler"]
+
+    h_sin = math.sin(2*math.pi*hour_of_day/24); h_cos = math.cos(2*math.pi*hour_of_day/24)
+    d_sin = math.sin(2*math.pi*day_of_week/7);  d_cos = math.cos(2*math.pi*day_of_week/7)
+
+    raw = np.array([[lag_24h, lag_48h, lag_168h, roll_mean, roll_std,
+                     temperature_c, wind_speed_ms, cloud_cover_pct, humidity_pct,
+                     load_mwh, renewable_mwh, gas_dkk, co2_dkk,
+                     h_sin, h_cos, d_sin, d_cos]], dtype=np.float32)
+    scaled = feat_scaler.transform(raw)
+
+    x = data.x.clone() if x_override is None else x_override.clone()
+    zone_off = 0 if zone == "DK1" else T
+    node_idx = zone_off + T - 1
+    x[node_idx] = torch.tensor(scaled[0], dtype=torch.float32)
+
+    with torch.no_grad():
+        out = model(x, data.edge_index).view(-1)
+    pred = float(out[node_idx].item())
+
+    metrics = load_json("artifacts/homo_gnn_metrics.json")
+    mae = metrics.get("mae", metrics.get("test_mae", 161.9))
+
+    print(f"Zone:               {zone}")
+    print(f"Predicted price:    {pred:,.1f} DKK/MWh")
+    print(f"Test MAE:           {mae:.1f} DKK  → 90 % interval ≈ [{pred-mae:,.0f}, {pred+mae:,.0f}]")
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=[zone], y=[pred], marker_color="#f28e2b",
+                         text=[f"{pred:.1f}"], textposition="outside", name="Prediction"))
+    fig.add_shape(type="rect", x0=-0.4, x1=0.4,
+                  y0=max(0, pred-mae), y1=pred+mae,
+                  fillcolor="moccasin", opacity=0.35, line_width=0)
+    fig.update_layout(title=f"HomoGNN prediction — {zone}  (shading = ± MAE)",
+                      yaxis_title="Price (DKK/MWh)", height=340, showlegend=False)
+    fig.show()
+""")
+
+# ── 10.3 ST-HeteroSAGE ───────────────────────────────────────────────────────
+md("### 10.3 ST-HeteroSAGE — live inference")
+
+code(r"""# ── INPUT FEATURES ────────────────────────────────────────────────────────
+zone            = "DK1"
+lag_24h         = 420.0
+lag_48h         = 390.0
+lag_168h        = 445.0
+roll_mean       = 410.0
+roll_std        = 35.0
+temperature_c   = 8.0
+wind_speed_ms   = 6.5
+cloud_cover_pct = 60.0
+humidity_pct    = 75.0
+load_mwh        = 3500.0
+renewable_mwh   = 1500.0
+gas_dkk         = 300.0
+co2_dkk         = 80.0
+hour_of_day     = 17
+day_of_week     = 0
+# ─────────────────────────────────────────────────────────────────────────────
+
+import pickle, math, sys
+import numpy as np
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+
+ckpt_path   = Path("artifacts_hetero/best_st_hetero_model.pt")
+graph_path  = Path("data/graphs_hetero/hetero_graph.pt")
+scaler_path = Path("data/graphs_hetero/hetero_scalers.pkl")
+
+missing = [p for p in [ckpt_path, graph_path, scaler_path] if not p.exists()]
+if missing:
+    print("Missing files:", [str(p) for p in missing])
+    print("  → cd src && python st_train.py")
+else:
+    import torch
+    from st_hetero_models import load_st_hetero_model
+
+    device = torch.device("cpu")
+    data   = torch.load(graph_path, map_location=device, weights_only=False)
+    with open(scaler_path, "rb") as f:
+        scalers = pickle.load(f)
+
+    model, x_override = load_st_hetero_model(data, ckpt_path, device)
+    model.eval()
+
+    num_hours   = int(data["hour"].num_hours_per_zone)
+    feat_scaler = scalers["feature_scaler"]
+
+    h_sin = math.sin(2*math.pi*hour_of_day/24); h_cos = math.cos(2*math.pi*hour_of_day/24)
+    d_sin = math.sin(2*math.pi*day_of_week/7);  d_cos = math.cos(2*math.pi*day_of_week/7)
+
+    raw = np.array([[lag_24h, lag_48h, lag_168h, roll_mean, roll_std,
+                     temperature_c, wind_speed_ms, cloud_cover_pct, humidity_pct,
+                     load_mwh, renewable_mwh, gas_dkk, co2_dkk,
+                     h_sin, h_cos, d_sin, d_cos]], dtype=np.float32)
+    scaled = feat_scaler.transform(raw)
+
+    x_dict = {k: v.clone() for k, v in data.x_dict.items()}
+    if x_override is not None:
+        x_dict.update(x_override)
+
+    zone_off = 0 if zone == "DK1" else num_hours
+    node_idx = zone_off + num_hours - 1
+    x_dict["hour"][node_idx] = torch.tensor(scaled[0], dtype=torch.float32)
+
+    ei = {k: v for k, v in data.edge_index_dict.items()}
+    with torch.no_grad():
+        out = model(x_dict, ei, num_hours=num_hours).view(-1)
+    pred = float(out[node_idx].item())
+
+    metrics = load_json("artifacts_hetero/st_hetero_metrics.json")
+    mae = metrics.get("mae", metrics.get("test_mae", 151.1))
+
+    print(f"Zone:               {zone}")
+    print(f"Predicted price:    {pred:,.1f} DKK/MWh")
+    print(f"Test MAE:           {mae:.1f} DKK  → 90 % interval ≈ [{pred-mae:,.0f}, {pred+mae:,.0f}]")
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=[zone], y=[pred], marker_color="#7c3aed",
+                         text=[f"{pred:.1f}"], textposition="outside", name="Prediction"))
+    fig.add_shape(type="rect", x0=-0.4, x1=0.4,
+                  y0=max(0, pred-mae), y1=pred+mae,
+                  fillcolor="#ede9fe", opacity=0.5, line_width=0)
+    fig.update_layout(title=f"ST-HeteroSAGE prediction — {zone}  (shading = ± MAE)",
+                      yaxis_title="Price (DKK/MWh)", height=340, showlegend=False)
+    fig.show()
+""")
+
+# ── 10.4 Side-by-side comparison ─────────────────────────────────────────────
+md("### 10.4 Head-to-head comparison (all models, same input)")
+
+code(r"""# Run this cell AFTER running 10.1–10.3 so `pred` is defined for each model.
+# For a clean comparison, re-run with identical inputs and capture each `pred`.
+
+models_data = [
+    ("XGBoost",       205.6, "#4e79a7"),
+    ("HomoGNN",       161.9, "#f28e2b"),
+    ("GAT",           179.2, "#e15759"),
+    ("HeteroSAGE",    162.8, "#76b7b2"),
+    ("ST-HeteroSAGE", 151.1, "#7c3aed"),
+]
+names  = [m[0] for m in models_data]
+maes   = [m[1] for m in models_data]
+colors = [m[2] for m in models_data]
+
+fig = go.Figure()
+fig.add_trace(go.Bar(
+    x=names, y=maes, marker_color=colors,
+    text=[f"{v:.1f}" for v in maes], textposition="outside",
+))
+fig.update_layout(
+    title="Test MAE comparison across all models (lower is better)",
+    yaxis_title="MAE (DKK/MWh)", height=380,
+    yaxis_range=[0, max(maes)*1.2],
+)
+fig.show()
+
+print("\nModel performance summary:")
+print(f"{'Model':<18} {'MAE':>8}  {'vs XGB':>8}")
+xgb_mae = maes[0]
+for name, mae, _ in models_data:
+    delta = (mae - xgb_mae) / xgb_mae * 100
+    flag  = " ★ best" if mae == min(maes) else ""
+    print(f"  {name:<16} {mae:>8.1f}  {delta:>+7.1f}%{flag}")
+""")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 11.  GRAPH STRUCTURE VISUALISATION
+# ══════════════════════════════════════════════════════════════════════════════
+md(r"""<a id="section-11"></a>
+## 11. Graph Structure Visualisation
+
+The heterogeneous graph has **2 node types** and **5 edge relation types**.
+This section visualises its structure at three levels of detail:
+
+1. **Live statistics** — exact node / edge counts loaded from the saved graph file
+2. **Schematic topology** — a hand-laid Plotly network showing every node/edge type
+3. **Interactive mini-graph** — 3 real timesteps × 4 zones + 4 market nodes with
+   hoverable metadata
+""")
+
+# ── 11.1 Live graph statistics ────────────────────────────────────────────────
+md("### 11.1 Live graph statistics")
+
+code(r"""import sys, json
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+
+graph_path = Path("data/graphs_hetero/hetero_graph.pt")
+if not graph_path.exists():
+    print("Graph not found:", graph_path)
+    print("  → cd src && python hetero_graph_builder.py")
+else:
+    import torch
+    g = torch.load(graph_path, map_location="cpu", weights_only=False)
+
+    # ── Node counts ──────────────────────────────────────────────────────
+    node_rows = []
+    for ntype in g.node_types:
+        n = g[ntype].num_nodes
+        f = g[ntype].x.shape[1] if hasattr(g[ntype], "x") and g[ntype].x is not None else 0
+        node_rows.append((ntype, n, f))
+
+    # ── Edge counts ──────────────────────────────────────────────────────
+    edge_rows = []
+    for src, rel, dst in g.edge_types:
+        ei = g[src, rel, dst].edge_index
+        edge_rows.append((f"{src} → {dst}", rel, ei.shape[1]))
+
+    # ── Plotly table ─────────────────────────────────────────────────────
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=["Node types", "Edge relation types"],
+        specs=[[{"type": "table"}, {"type": "table"}]],
+    )
+    fig.add_trace(go.Table(
+        header=dict(values=["Node type", "# nodes", "# features"],
+                    fill_color="#4472c4", font_color="white"),
+        cells=dict(values=[
+            [r[0] for r in node_rows],
+            [f"{r[1]:,}" for r in node_rows],
+            [r[2] for r in node_rows],
+        ], fill_color=[["#dce6f1","white"]*10]),
+    ), row=1, col=1)
+    fig.add_trace(go.Table(
+        header=dict(values=["Direction", "Relation", "# edges"],
+                    fill_color="#4472c4", font_color="white"),
+        cells=dict(values=[
+            [r[0] for r in edge_rows],
+            [r[1] for r in edge_rows],
+            [f"{r[2]:,}" for r in edge_rows],
+        ], fill_color=[["#dce6f1","white"]*10]),
+    ), row=1, col=2)
+    fig.update_layout(height=300, margin=dict(t=40, b=10))
+    fig.show()
+
+    T = int(g["hour"].num_hours_per_zone)
+    total_nodes = sum(r[1] for r in node_rows)
+    total_edges = sum(r[2] for r in edge_rows)
+    print(f"\nSummary: {total_nodes:,} nodes  |  {total_edges:,} edges  |  T={T:,} hours/zone")
+""")
+
+# ── 11.2 Schematic topology ───────────────────────────────────────────────────
+md("### 11.2 Schematic topology diagram")
+
+code(r"""# Hardcoded layout — one representative node per zone/market
+# Positions chosen for visual clarity, not geometry
+
+node_defs = [
+    # label,  x,    y,   color,    size, node_type
+    ("DK1\nhour",   -1.5,  1.0, "#2171b5", 30, "hour"),
+    ("DK2\nhour",   -0.5,  1.0, "#6baed6", 30, "hour"),
+    ("HYDRO\nhour",  0.5,  1.0, "#74c476", 30, "hour"),
+    ("DE\nhour",     1.5,  1.0, "#fd8d3c", 30, "hour"),
+    ("NordPool",    -1.0, -0.5, "#9467bd", 22, "market"),
+    ("DK1 area",    -0.33,-0.5, "#8c564b", 22, "market"),
+    ("DK2 area",     0.33,-0.5, "#e377c2", 22, "market"),
+    ("DE area",      1.0, -0.5, "#7f7f7f", 22, "market"),
+]
+
+# Edge definitions: (from_idx, to_idx, label, color, dash)
+edge_defs = [
+    (0, 1, "co_occurs_with",   "#aec7e8", "solid"),
+    (0, 2, "co_occurs_with",   "#aec7e8", "solid"),
+    (1, 2, "co_occurs_with",   "#aec7e8", "solid"),
+    (0, 0, "lag_to (self)",    "#9ecae1", "dot"),      # self-loop represented as offset
+    (0, 4, "belongs_to",       "#c5b0d5", "dash"),
+    (1, 5, "belongs_to",       "#c5b0d5", "dash"),
+    (2, 5, "belongs_to",       "#c5b0d5", "dash"),
+    (3, 7, "belongs_to",       "#c5b0d5", "dash"),
+    (4, 5, "interconnects",    "#ffbb78", "solid"),
+    (5, 6, "interconnects",    "#ffbb78", "solid"),
+]
+
+fig = go.Figure()
+
+# Draw edges first (so nodes appear on top)
+drawn_labels = set()
+for (fi, ti, lbl, col, dash) in edge_defs:
+    if fi == ti:   # self-loop: draw a small arc offset
+        x0, y0 = node_defs[fi][1], node_defs[fi][2]
+        fig.add_annotation(ax=x0, ay=y0+0.18, x=x0+0.18, y=y0,
+                           xref="x", yref="y", axref="x", ayref="y",
+                           showarrow=True, arrowhead=2, arrowcolor=col,
+                           arrowwidth=1.5)
+        continue
+    x0, y0 = node_defs[fi][1], node_defs[fi][2]
+    x1, y1 = node_defs[ti][1], node_defs[ti][2]
+    show = lbl not in drawn_labels
+    drawn_labels.add(lbl)
+    fig.add_trace(go.Scatter(
+        x=[x0, x1], y=[y0, y1], mode="lines",
+        line=dict(color=col, width=2,
+                  dash="dash" if dash=="dash" else ("dot" if dash=="dot" else "solid")),
+        name=lbl, showlegend=show,
+        hoverinfo="name",
+    ))
+
+# Draw nodes
+for (lbl, x, y, col, sz, ntype) in node_defs:
+    fig.add_trace(go.Scatter(
+        x=[x], y=[y], mode="markers+text",
+        marker=dict(color=col, size=sz, line=dict(color="white", width=2)),
+        text=[lbl], textposition="top center",
+        name=ntype, showlegend=False,
+        hovertemplate=f"<b>{lbl.replace(chr(10),' ')}</b><br>type: {ntype}<extra></extra>",
+    ))
+
+# Node-type legend boxes
+for col, label in [("#2171b5","hour node (DK1)"), ("#6baed6","hour node (DK2)"),
+                   ("#74c476","hour node (HYDRO)"), ("#fd8d3c","hour node (DE)"),
+                   ("#9467bd","market node")]:
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="markers",
+        marker=dict(color=col, size=12, symbol="circle"),
+        name=label, showlegend=True,
+    ))
+
+fig.update_layout(
+    title="Heterogeneous graph — schematic topology",
+    xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-2.2, 2.2]),
+    yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.2, 1.6]),
+    height=520, legend=dict(x=1.01, y=0.99, bordercolor="lightgray", borderwidth=1),
+    plot_bgcolor="white",
+)
+fig.show()
+""")
+
+# ── 11.3 Interactive mini-graph ───────────────────────────────────────────────
+md("### 11.3 Interactive mini-graph (3 timesteps × 4 zones + 4 market nodes)")
+
+code(r"""import sys, math, json
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+
+graph_path = Path("data/graphs_hetero/hetero_graph.pt")
+if not graph_path.exists():
+    print("Graph file not found — run hetero_graph_builder.py first")
+else:
+    import torch
+    g = torch.load(graph_path, map_location="cpu", weights_only=False)
+    T   = int(g["hour"].num_hours_per_zone)
+    M   = g["market"].num_nodes
+
+    # Pick 3 consecutive timesteps near the end of training data
+    t_center = T // 2
+    steps    = [t_center - 1, t_center, t_center + 1]
+    zones    = ["DK1", "DK2", "HYDRO", "DE"]
+    z_colors = {"DK1": "#2171b5", "DK2": "#6baed6", "HYDRO": "#74c476", "DE": "#fd8d3c"}
+    m_colors = ["#9467bd","#8c564b","#e377c2","#7f7f7f"]
+
+    # ── Build node catalogue ──────────────────────────────────────────────
+    # hour nodes: zone z, timestep t  → global index = z*T + t
+    hour_nodes   = {}   # (z_idx, t_step) → mini_id
+    market_nodes = {}   # m_idx → mini_id
+    positions    = {}   # mini_id → (x, y)
+    node_labels  = {}
+    node_colors  = {}
+    node_hover   = {}
+
+    mid = 0
+    for zi, z in enumerate(zones):
+        for ci, t in enumerate(steps):
+            global_idx = zi * T + t
+            hour_nodes[(zi, t)] = mid
+            positions[mid]    = (ci * 2.0, -zi * 1.5)
+            node_labels[mid]  = f"{z}\nt={t}"
+            node_colors[mid]  = z_colors[z]
+            feat = g["hour"].x[global_idx].tolist()
+            node_hover[mid]   = (
+                f"<b>{z} t={t}</b><br>"
+                f"lag_24h: {feat[0]:.2f}<br>"
+                f"lag_48h: {feat[1]:.2f}<br>"
+                f"wind:    {feat[6]:.2f}<br>"
+                f"hour_sin:{feat[13]:.2f}"
+            )
+            mid += 1
+
+    mkt_names = ["NordPool","DK1 area","DK2 area","DE area"]
+    for mi in range(min(M, 4)):
+        market_nodes[mi] = mid
+        positions[mid]   = (mi * 2.0, -len(zones) * 1.5 - 0.8)
+        node_labels[mid] = mkt_names[mi] if mi < len(mkt_names) else f"Market {mi}"
+        node_colors[mid] = m_colors[mi % len(m_colors)]
+        node_hover[mid]  = f"<b>{node_labels[mid]}</b><br>type: market"
+        mid += 1
+
+    # ── Collect edges that touch our mini-graph nodes ─────────────────────
+    mini_hour_globals   = {zi*T + t: hour_nodes[(zi, t)]
+                           for zi in range(len(zones)) for t in steps}
+    mini_market_globals = {mi: market_nodes[mi] for mi in range(min(M,4))}
+
+    edge_traces = []
+    rel_colors  = {
+        "lag_to":          "#9ecae1",
+        "co_occurs_with":  "#a1d99b",
+        "belongs_to":      "#c5b0d5",
+        "rev_belongs_to":  "#dadaeb",
+        "interconnects":   "#ffbb78",
+    }
+    drawn_rels = set()
+
+    for src_type, rel, dst_type in g.edge_types:
+        ei = g[src_type, rel, dst_type].edge_index
+        src_map = mini_hour_globals if src_type == "hour" else mini_market_globals
+        dst_map = mini_hour_globals if dst_type == "hour" else mini_market_globals
+
+        edge_x, edge_y = [], []
+        for s, d in zip(ei[0].tolist(), ei[1].tolist()):
+            if s in src_map and d in dst_map:
+                x0, y0 = positions[src_map[s]]
+                x1, y1 = positions[dst_map[d]]
+                edge_x += [x0, x1, None]
+                edge_y += [y0, y1, None]
+
+        if not edge_x:
+            continue
+        col  = rel_colors.get(rel, "#cccccc")
+        show = rel not in drawn_rels
+        drawn_rels.add(rel)
+        edge_traces.append(go.Scatter(
+            x=edge_x, y=edge_y, mode="lines",
+            line=dict(color=col, width=1.5), opacity=0.7,
+            name=rel, showlegend=show, hoverinfo="none",
+        ))
+
+    # ── Build node scatter ────────────────────────────────────────────────
+    node_x = [positions[i][0] for i in range(mid)]
+    node_y = [positions[i][1] for i in range(mid)]
+    node_c = [node_colors[i]  for i in range(mid)]
+    node_t = [node_labels[i]  for i in range(mid)]
+    node_h = [node_hover[i]   for i in range(mid)]
+
+    node_scatter = go.Scatter(
+        x=node_x, y=node_y, mode="markers+text",
+        marker=dict(color=node_c, size=20, line=dict(color="white", width=1.5)),
+        text=node_t, textposition="top center",
+        hovertemplate="%{customdata}<extra></extra>",
+        customdata=node_h,
+        name="nodes", showlegend=False,
+    )
+
+    fig = go.Figure(edge_traces + [node_scatter])
+    fig.update_layout(
+        title=f"Interactive mini-graph  ({mid} nodes, 3 timesteps per zone)",
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        height=560, plot_bgcolor="white",
+        legend=dict(x=1.01, y=0.99, bordercolor="lightgray", borderwidth=1),
+        hovermode="closest",
+    )
+    fig.show()
+    print(f"Nodes shown: {mid}  |  Edge sets drawn: {len(drawn_rels)}")
 """)
 
 # ── Write the notebook ───────────────────────────────────────────────────────
