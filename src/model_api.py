@@ -102,6 +102,10 @@ class PredictRequest(BaseModel):
     wind_speed_ms: float
     cloud_cover_pct: float
     humidity_pct: float
+    load_mwh: float = Field(default=3500.0, description="System load forecast (MWh)")
+    renewable_mwh: float = Field(default=1500.0, description="Renewable generation forecast (MWh)")
+    gas_dkk: float = Field(default=300.0, description="Gas price (DKK/MWh)")
+    co2_dkk: float = Field(default=80.0, description="CO2 price (DKK/tonne)")
     hour_of_day: int = Field(..., ge=0, le=23)
     day_of_week: int = Field(default=0, ge=0, le=6)
 
@@ -139,9 +143,9 @@ def predict(req: PredictRequest):
     try:
         import torch
 
-        # Build 13-feature vector (same order as hetero_graph_builder extract_features + cyclical)
+        # Build 17-feature vector matching hetero_graph_builder.py extract_features + cyclical:
         # [lag_24h, lag_48h, lag_168h, roll24_mean, roll24_std, temp, wind, cloud, humidity,
-        #  hour_sin, hour_cos, week_sin, week_cos]
+        #  load_mwh, renewable_mwh, gas_dkk, co2_dkk, hour_sin, hour_cos, week_sin, week_cos]
         hour_sin = math.sin(2 * math.pi * req.hour_of_day / 24.0)
         hour_cos = math.cos(2 * math.pi * req.hour_of_day / 24.0)
         week_sin = math.sin(2 * math.pi * req.day_of_week / 7.0)
@@ -157,11 +161,15 @@ def predict(req: PredictRequest):
             req.wind_speed_ms,
             req.cloud_cover_pct,
             req.humidity_pct,
+            req.load_mwh,
+            req.renewable_mwh,
+            req.gas_dkk,
+            req.co2_dkk,
             hour_sin,
             hour_cos,
             week_sin,
             week_cos,
-        ]], dtype=np.float32)  # shape (1, 13)
+        ]], dtype=np.float32)  # shape (1, 17)
 
         feat_scaler = _scalers["feature_scaler"]
         scaled_features = feat_scaler.transform(raw_features)  # (1, 13)
