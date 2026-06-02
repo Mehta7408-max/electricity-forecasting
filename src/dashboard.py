@@ -38,6 +38,9 @@ _SRC_ARTIFACTS = _SRC / "artifacts"
 _HETERO = _SRC / "artifacts_hetero"
 
 XGB_METRICS_PATH = _ARTIFACTS / "xgboost_metrics.json"
+XGB_MODEL_PATH = _ARTIFACTS / "xgboost_baseline.pkl"
+SCALER_PATH = _SRC / "data" / "graphs_hetero" / "hetero_scalers.pkl"
+DATASET_START = "2019-12-31 23:00:00"  # first timestamp; node t = start + t hours
 HOMO_METRICS_PATH = _SRC_ARTIFACTS / "homo_gnn_metrics.json"
 GAT_METRICS_PATH = _HETERO / "gat_metrics_clean.json"
 HETERO_METRICS_PATH = _HETERO / "hetero_metrics_clean.json"
@@ -250,18 +253,59 @@ def page_overview():
 # ---------------------------------------------------------------------------
 # Page 2 — Live Prediction
 # ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def _load_xgb_model():
+    """Load the XGBoost baseline for local (API-free) inference."""
+    try:
+        import pickle
+        with open(XGB_MODEL_PATH, "rb") as f:
+            return pickle.load(f)
+    except Exception as exc:
+        return {"_error": str(exc)}
+
+
+def _predict_local_xgb(req):
+    """Run the XGBoost baseline locally. `req` is the same dict sent to the API.
+
+    Feature order matches xgboost_baseline.py:
+      hour_of_day, minute, zone_id, lag_24h, lag_48h, lag_168h,
+      roll_mean, roll_std, neighbor_de, neighbor_hydro, temp, wind, cloud
+    """
+    import numpy as np
+    model = _load_xgb_model()
+    if isinstance(model, dict) and "_error" in model:
+        return None, model["_error"]
+    zone_id = 0 if req["zone"].upper() == "DK1" else 1
+    # The form doesn't collect neighbour-zone prices; lag_24h is a leakage-free proxy.
+    neighbor = req["lag_24h"]
+    x = np.array([[
+        req["hour_of_day"], 0, zone_id,
+        req["lag_24h"], req["lag_48h"], req["lag_168h"],
+        req["rolling_24h_mean"], req["rolling_24h_std"],
+        neighbor, neighbor,
+        req["temperature_c"], req["wind_speed_ms"], req["cloud_cover_pct"],
+    ]], dtype=float)
+    try:
+        return float(model.predict(x)[0]), None
+    except Exception as exc:
+        return None, str(exc)
+
+
 def page_predict(api_up):
     st.title("🔮 Live Prediction")
     st.markdown(
-        "Single-step price forecast from the served HeteroSAGE model. Inputs map "
-        "directly onto the FastAPI `PredictRequest` schema."
+        "Single-step price forecast. When the FastAPI server is up the request "
+        "is served by the **HeteroSAGE** model; otherwise the dashboard falls "
+        "back to a **local XGBoost** prediction so the page always works."
     )
 
-    if not api_up:
+    if api_up:
+        st.success("🟢 API connected — predictions served by HeteroSAGE.")
+    else:
         st.info(
-            "The prediction endpoint needs the FastAPI server running. Start it with "
-            "`make serve` (or `docker compose up api`), then reload this page. "
-            f"The dashboard is targeting `API_BASE={API_BASE}`."
+            "🔵 API offline — using the **local XGBoost baseline**. To serve the "
+            "HeteroSAGE model instead, start the API with `make serve` "
+            f"(or `docker compose up api`). Target: `API_BASE={API_BASE}`."
         )
 
     with st.form("predict_form"):
@@ -286,7 +330,7 @@ def page_predict(api_up):
             hour_of_day = st.slider("hour_of_day", 0, 23, 18)
             day_of_week = st.slider("day_of_week (0=Mon)", 0, 6, 0)
 
-        submitted = st.form_submit_button("Predict price", type="primary", disabled=not api_up)
+        submitted = st.form_submit_button("Predict price", type="primary")
 
     if submitted:
         payload = {
@@ -307,16 +351,31 @@ def page_predict(api_up):
             "hour_of_day": hour_of_day,
             "day_of_week": day_of_week,
         }
-        result = api_post("/predict", payload)
-        if result is None:
-            st.error("Could not reach the API. Is the server running (`make serve`)?")
-        elif "_error" in result:
-            st.error(f"API returned {result['_error']}: {result.get('detail')}")
-        else:
+        result = api_post("/predict", payload) if api_up else None
+
+        if result is not None and "_error" not in result:
             st.metric(
-                f"Predicted price — {result.get('zone', zone)}",
+                f"Predicted price — {result.get('zone', zone)}  (HeteroSAGE)",
                 f"{result.get('predicted_price_dkk', float('nan')):.2f} DKK",
             )
+        else:
+            if result is not None and "_error" in result:
+                st.warning(
+                    f"API error {result['_error']}: {result.get('detail')} — "
+                    "falling back to local XGBoost."
+                )
+            pred, err = _predict_local_xgb(payload)
+            if pred is None:
+                st.error(f"Local prediction failed: {err}")
+            else:
+                st.metric(
+                    f"Predicted price — {zone}  (local XGBoost)",
+                    f"{pred:.2f} DKK",
+                )
+                st.caption(
+                    "Served locally by the XGBoost baseline (MAE ≈ 206 DKK). Start "
+                    "the API for the more accurate HeteroSAGE model (MAE ≈ 163 DKK)."
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +780,22 @@ def _load_hetero_graph():
         return {"_error": str(exc)}
 
 
+@st.cache_resource(show_spinner=False)
+def _load_feature_scaler():
+    """Load the fitted feature scaler (for inverse-transforming hover values)."""
+    try:
+        import pickle
+        with open(SCALER_PATH, "rb") as f:
+            return pickle.load(f).get("feature_scaler")
+    except Exception:
+        return None
+
+
+def _node_datetime(t):
+    """Map an in-zone timestep index to its real timestamp."""
+    return (pd.Timestamp(DATASET_START) + pd.Timedelta(hours=int(t))).strftime("%Y-%m-%d %H:%M")
+
+
 def page_graph():
     st.title("🕸️ Graph Structure")
     st.markdown(
@@ -775,70 +850,95 @@ def page_graph():
         st.info("Live statistics unavailable — graph file not loaded.")
 
     # ---- 2. Schematic topology -------------------------------------------
-    st.subheader("2. Schematic topology")
-    st.caption("One representative node per zone / market — positions chosen for clarity, not geometry.")
+    st.subheader("2. Schematic — spatio-temporal layout")
+    st.caption(
+        "Each **zone is a chain of hourly nodes** (here 3 timesteps shown; the real "
+        "graph has ~50k per zone). Read left→right as time. Horizontal arrows are the "
+        "temporal links; vertical lines are same-hour price co-movement across zones; "
+        "dashed lines attach hours to their market node."
+    )
 
-    node_defs = [
-        ("DK1\nhour",   -1.5,  1.0, ZONE_COLORS["DK1"],   30, "hour"),
-        ("DK2\nhour",   -0.5,  1.0, ZONE_COLORS["DK2"],   30, "hour"),
-        ("HYDRO\nhour",  0.5,  1.0, ZONE_COLORS["HYDRO"], 30, "hour"),
-        ("DE\nhour",     1.5,  1.0, ZONE_COLORS["DE"],    30, "hour"),
-        ("NordPool",    -1.0, -0.5, "#9467bd", 22, "market"),
-        ("DK1 area",    -0.33,-0.5, "#8c564b", 22, "market"),
-        ("DK2 area",     0.33,-0.5, "#e377c2", 22, "market"),
-        ("DE area",      1.0, -0.5, "#7f7f7f", 22, "market"),
-    ]
-    edge_defs = [
-        (0, 1, "co_occurs_with", "#aec7e8", "solid"),
-        (0, 2, "co_occurs_with", "#aec7e8", "solid"),
-        (1, 2, "co_occurs_with", "#aec7e8", "solid"),
-        (0, 0, "lag_to (self)",  "#9ecae1", "dot"),
-        (0, 4, "belongs_to",     "#c5b0d5", "dash"),
-        (1, 5, "belongs_to",     "#c5b0d5", "dash"),
-        (2, 5, "belongs_to",     "#c5b0d5", "dash"),
-        (3, 7, "belongs_to",     "#c5b0d5", "dash"),
-        (4, 5, "interconnects",  "#ffbb78", "solid"),
-        (5, 6, "interconnects",  "#ffbb78", "solid"),
-    ]
+    zones = ["DK1", "DK2", "HYDRO", "DE"]
+    zone_y = {"DK1": 4.0, "DK2": 3.0, "HYDRO": 2.0, "DE": 1.0}
+    cols_x = [0.0, 2.0, 4.0]               # t-2, t-1, t
+    col_lbl = ["t−2", "t−1", "t (target)"]
+    market_y = -0.4
+    market_x = {"NordPool": 0.0, "DK1 area": 1.5, "DK2 area": 3.0, "DE area": 4.0}
+    market_color = {"NordPool": "#9467bd", "DK1 area": "#8c564b",
+                    "DK2 area": "#e377c2", "DE area": "#7f7f7f"}
 
     fig = go.Figure()
-    drawn = set()
-    for fi, ti, lbl, col, dash in edge_defs:
-        if fi == ti:
-            x0, y0 = node_defs[fi][1], node_defs[fi][2]
-            fig.add_annotation(ax=x0, ay=y0 + 0.18, x=x0 + 0.18, y=y0,
-                               xref="x", yref="y", axref="x", ayref="y",
-                               showarrow=True, arrowhead=2, arrowcolor=col, arrowwidth=1.5)
-            continue
-        x0, y0 = node_defs[fi][1], node_defs[fi][2]
-        x1, y1 = node_defs[ti][1], node_defs[ti][2]
-        show = lbl not in drawn
-        drawn.add(lbl)
+    legend_done = set()
+
+    def _edge(x0, y0, x1, y1, color, name, dash="solid", width=2):
+        show = name not in legend_done
+        legend_done.add(name)
         fig.add_trace(go.Scatter(
             x=[x0, x1], y=[y0, y1], mode="lines",
-            line=dict(color=col, width=2, dash=dash if dash in ("dash", "dot") else "solid"),
-            name=lbl, showlegend=show, hoverinfo="name",
+            line=dict(color=color, width=width, dash=dash),
+            name=name, showlegend=show, hoverinfo="name",
         ))
-    for lbl, x, y, col, sz, ntype in node_defs:
+
+    # lag_to — temporal, horizontal within each zone row (arrows)
+    for z in zones:
+        y = zone_y[z]
+        for ci in range(len(cols_x) - 1):
+            _edge(cols_x[ci], y, cols_x[ci + 1], y, "#3182bd",
+                  "lag_to (temporal: hour→next hour)", width=2.5)
+            fig.add_annotation(ax=cols_x[ci], ay=y, x=cols_x[ci + 1], y=y,
+                               xref="x", yref="y", axref="x", ayref="y",
+                               showarrow=True, arrowhead=3, arrowsize=1.2,
+                               arrowwidth=2, arrowcolor="#3182bd")
+
+    # co_occurs_with — spatial, vertical at each timestep (DE excluded)
+    co_zones = ["DK1", "DK2", "HYDRO"]
+    for ci in range(len(cols_x)):
+        for a, b in zip(co_zones[:-1], co_zones[1:]):
+            _edge(cols_x[ci], zone_y[a], cols_x[ci], zone_y[b], "#31a354",
+                  "co_occurs_with (spatial: same-hour price co-movement)", width=1.8)
+
+    # belongs_to — each zone's target hour → its market node (dashed)
+    belongs = {"DK1": "DK1 area", "DK2": "DK2 area", "HYDRO": "NordPool", "DE": "DE area"}
+    for z, mk in belongs.items():
+        _edge(cols_x[-1], zone_y[z], market_x[mk], market_y, "#9e9ac8",
+              "belongs_to (hour → market)", dash="dash", width=1.5)
+
+    # interconnects — market ↔ market (transmission capacity)
+    for a, b in [("NordPool", "DK1 area"), ("DK1 area", "DK2 area"), ("DK2 area", "DE area")]:
+        _edge(market_x[a], market_y, market_x[b], market_y, "#fd8d3c",
+              "interconnects (market ↔ market: transmission)", width=2)
+
+    # Hour nodes
+    for z in zones:
+        y = zone_y[z]
         fig.add_trace(go.Scatter(
-            x=[x], y=[y], mode="markers+text",
-            marker=dict(color=col, size=sz, line=dict(color="white", width=2)),
-            text=[lbl], textposition="top center", showlegend=False,
-            hovertemplate=f"<b>{lbl.replace(chr(10), ' ')}</b><br>type: {ntype}<extra></extra>",
+            x=cols_x, y=[y] * len(cols_x), mode="markers+text",
+            marker=dict(color=ZONE_COLORS[z], size=30, line=dict(color="white", width=2)),
+            text=[z if ci == 0 else "" for ci in range(len(cols_x))],
+            textposition="middle left", showlegend=False,
+            hovertemplate=f"<b>{z}</b> hour node<extra></extra>",
         ))
-    for col, label in [(ZONE_COLORS["DK1"], "hour (DK1)"), (ZONE_COLORS["DK2"], "hour (DK2)"),
-                       (ZONE_COLORS["HYDRO"], "hour (HYDRO)"), (ZONE_COLORS["DE"], "hour (DE)"),
-                       ("#9467bd", "market node")]:
+    # Market nodes
+    for mk, mx in market_x.items():
         fig.add_trace(go.Scatter(
-            x=[None], y=[None], mode="markers",
-            marker=dict(color=col, size=12), name=label, showlegend=True,
+            x=[mx], y=[market_y], mode="markers+text",
+            marker=dict(color=market_color[mk], size=24, symbol="square",
+                        line=dict(color="white", width=2)),
+            text=[mk], textposition="bottom center", showlegend=False,
+            hovertemplate=f"<b>{mk}</b> market node<extra></extra>",
         ))
+    # Column time labels
+    for ci, lbl in enumerate(col_lbl):
+        fig.add_annotation(x=cols_x[ci], y=zone_y["DK1"] + 0.55, text=f"<b>{lbl}</b>",
+                           showarrow=False, font=dict(size=12, color="#555"))
+
     fig.update_layout(
-        title="Heterogeneous graph — schematic topology",
-        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-2.2, 2.2]),
-        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.2, 1.6]),
-        height=520, plot_bgcolor="white",
-        legend=dict(x=1.01, y=0.99, bordercolor="lightgray", borderwidth=1),
+        title="Heterogeneous graph — spatio-temporal schematic (2 node types, 5 edge types)",
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.2, 5.2]),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.4, 5.0]),
+        height=560, plot_bgcolor="white",
+        legend=dict(x=1.01, y=0.99, bordercolor="lightgray", borderwidth=1,
+                    font=dict(size=10)),
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -848,89 +948,119 @@ def page_graph():
         st.info("Mini-graph unavailable — graph file not loaded.")
         return
 
-    st.caption("A real slice of the graph: a few timesteps per zone plus the market nodes. Hover any node for its features.")
+    st.caption(
+        "A real slice of the graph: consecutive hours per zone plus the 4 market "
+        "nodes. Hover a node for its **actual** price and weather (inverse-transformed "
+        "to real units). Edges are filtered from the full graph for exactly these nodes."
+    )
+    import numpy as np
+    import torch
+
     T = int(g["hour"].num_hours_per_zone)
     M = g["market"].num_nodes
-    n_steps = st.slider("Timesteps per zone", min_value=2, max_value=5, value=3)
-
-    t_center = T // 2
-    half = n_steps // 2
-    steps = list(range(t_center - half, t_center - half + n_steps))
     zones = ["DK1", "DK2", "HYDRO", "DE"]
     m_colors = ["#9467bd", "#8c564b", "#e377c2", "#7f7f7f"]
     mkt_names = ["NordPool", "DK1 area", "DK2 area", "DE area"]
+    scaler = _load_feature_scaler()
 
-    hour_nodes, market_nodes = {}, {}
+    c_a, c_b = st.columns(2)
+    n_steps = c_a.slider("Hours per zone", min_value=2, max_value=6, value=3)
+    # Anchor on the start of the test window so labels show recent, real dates
+    default_anchor = int(T * 0.85)
+    t_start = c_b.slider("Start hour index", min_value=0, max_value=max(0, T - n_steps),
+                         value=min(default_anchor, T - n_steps), step=24)
+    steps = list(range(t_start, t_start + n_steps))
+
+    # ── Global indices of the selected hour nodes (zone z occupies [z*T, (z+1)*T)) ──
+    hour_global = {}      # global idx -> mini id
+    market_global = {}    # global idx (0..M-1) -> mini id
     positions, labels, colors_, hovers = {}, {}, {}, {}
     mid = 0
+
+    # Pre-build an inverse-transformed view of just the selected hour rows
+    sel_global = [zi * T + t for zi in range(len(zones)) for t in steps]
+    feats_scaled = g["hour"].x[sel_global].numpy()
+    feats_raw = scaler.inverse_transform(feats_scaled) if scaler is not None else feats_scaled
+    raw_by_global = {gi: feats_raw[i] for i, gi in enumerate(sel_global)}
+
     for zi, z in enumerate(zones):
         for ci, t in enumerate(steps):
-            gidx = zi * T + t
-            hour_nodes[gidx] = mid
+            gi = zi * T + t
+            hour_global[gi] = mid
             positions[mid] = (ci * 2.0, -zi * 1.5)
-            labels[mid] = f"{z}\nt={t}"
+            labels[mid] = z if ci == 0 else ""
             colors_[mid] = ZONE_COLORS[z]
-            feat = g["hour"].x[gidx].tolist()
+            price = float(g["hour"].y[gi])
+            r = raw_by_global[gi]
             hovers[mid] = (
-                f"<b>{z} t={t}</b><br>lag_24h: {feat[0]:.2f}<br>"
-                f"lag_48h: {feat[1]:.2f}<br>wind: {feat[6]:.2f}<br>"
-                f"hour_sin: {feat[13]:.2f}"
+                f"<b>{z}</b> &nbsp; {_node_datetime(t)}<br>"
+                f"actual price: {price:,.0f} DKK<br>"
+                f"lag_24h: {r[0]:,.0f} DKK<br>"
+                f"temp: {r[5]:.1f} °C &nbsp; wind: {r[6]:.1f} m/s"
             )
             mid += 1
+
     for mi in range(min(M, 4)):
-        market_nodes[mi] = mid
+        market_global[mi] = mid
         positions[mid] = (mi * 2.0, -len(zones) * 1.5 - 0.8)
         labels[mid] = mkt_names[mi] if mi < len(mkt_names) else f"Market {mi}"
         colors_[mid] = m_colors[mi % len(m_colors)]
-        hovers[mid] = f"<b>{labels[mid]}</b><br>type: market"
+        hovers[mid] = f"<b>{labels[mid]}</b><br>market node"
         mid += 1
 
+    # ── Vectorised edge filtering with torch.isin ──────────────────────────
     rel_colors = {
-        "lag_to": "#9ecae1", "co_occurs_with": "#a1d99b", "belongs_to": "#c5b0d5",
-        "rev_belongs_to": "#dadaeb", "interconnects": "#ffbb78",
+        "lag_to": "#3182bd", "co_occurs_with": "#31a354", "belongs_to": "#9e9ac8",
+        "rev_belongs_to": "#bcbddc", "interconnects": "#fd8d3c",
     }
+    hour_keep = torch.tensor(sorted(hour_global), dtype=torch.long)
+    mkt_keep = torch.tensor(sorted(market_global), dtype=torch.long)
     edge_traces, drawn_rels = [], set()
+
     for src_type, rel, dst_type in g.edge_types:
         ei = g[src_type, rel, dst_type].edge_index
-        src_map = hour_nodes if src_type == "hour" else market_nodes
-        dst_map = hour_nodes if dst_type == "hour" else market_nodes
-        ex, ey = [], []
-        for s, d in zip(ei[0].tolist(), ei[1].tolist()):
-            if s in src_map and d in dst_map:
-                x0, y0 = positions[src_map[s]]
-                x1, y1 = positions[dst_map[d]]
-                ex += [x0, x1, None]
-                ey += [y0, y1, None]
-        if not ex:
+        src_keep = hour_keep if src_type == "hour" else mkt_keep
+        dst_keep = hour_keep if dst_type == "hour" else mkt_keep
+        mask = torch.isin(ei[0], src_keep) & torch.isin(ei[1], dst_keep)
+        if not bool(mask.any()):
             continue
+        kept = ei[:, mask]
+        src_map = hour_global if src_type == "hour" else market_global
+        dst_map = hour_global if dst_type == "hour" else market_global
+        ex, ey = [], []
+        for s, d in zip(kept[0].tolist(), kept[1].tolist()):
+            x0, y0 = positions[src_map[s]]
+            x1, y1 = positions[dst_map[d]]
+            ex += [x0, x1, None]
+            ey += [y0, y1, None]
         show = rel not in drawn_rels
         drawn_rels.add(rel)
         edge_traces.append(go.Scatter(
             x=ex, y=ey, mode="lines",
             line=dict(color=rel_colors.get(rel, "#cccccc"), width=1.5),
-            opacity=0.7, name=rel, showlegend=show, hoverinfo="none",
+            opacity=0.75, name=rel, showlegend=show, hoverinfo="none",
         ))
 
     node_scatter = go.Scatter(
         x=[positions[i][0] for i in range(mid)],
         y=[positions[i][1] for i in range(mid)],
         mode="markers+text",
-        marker=dict(color=[colors_[i] for i in range(mid)], size=20,
+        marker=dict(color=[colors_[i] for i in range(mid)], size=22,
                     line=dict(color="white", width=1.5)),
-        text=[labels[i] for i in range(mid)], textposition="top center",
+        text=[labels[i] for i in range(mid)], textposition="middle left",
         customdata=[hovers[i] for i in range(mid)],
         hovertemplate="%{customdata}<extra></extra>", showlegend=False,
     )
     fig2 = go.Figure(edge_traces + [node_scatter])
     fig2.update_layout(
-        title=f"Interactive mini-graph ({mid} nodes, {n_steps} timesteps per zone)",
+        title=f"Interactive mini-graph — {n_steps} hours/zone from {_node_datetime(t_start)}",
         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
         yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
         height=560, plot_bgcolor="white", hovermode="closest",
         legend=dict(x=1.01, y=0.99, bordercolor="lightgray", borderwidth=1),
     )
     st.plotly_chart(fig2, use_container_width=True)
-    st.caption(f"Nodes shown: {mid}  |  Edge sets drawn: {len(drawn_rels)}")
+    st.caption(f"Nodes shown: {mid}  |  Edge relation types present in this slice: {len(drawn_rels)}")
 
 
 # ---------------------------------------------------------------------------
