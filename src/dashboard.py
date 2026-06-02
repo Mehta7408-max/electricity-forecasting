@@ -47,12 +47,14 @@ ABLATION_PATH = _HETERO / "st_ablation_results.json"
 ROBUSTNESS_PATH = _HETERO / "st_robustness_results.json"
 INTERP_PATH = _HETERO / "st_interpretability.json"
 LAST_RUN_PATH = _HETERO / "last_pipeline_run.json"
+GRAPH_PATH = _SRC / "data" / "graphs_hetero" / "hetero_graph.pt"
 
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
 HETERO_COLOR = "#2563eb"
 ST_COLOR = "#7c3aed"
 NEUTRAL_COLORS = ["#9ca3af", "#6b7280", "#4b5563", HETERO_COLOR, ST_COLOR]
+ZONE_COLORS = {"DK1": "#2171b5", "DK2": "#6baed6", "HYDRO": "#74c476", "DE": "#fd8d3c"}
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +709,231 @@ def page_mlops(api_up):
 
 
 # ---------------------------------------------------------------------------
+# Page — Graph Structure
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def _load_hetero_graph():
+    """Load the heterogeneous graph object (cached across reruns)."""
+    try:
+        import torch
+        return torch.load(GRAPH_PATH, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        return {"_error": str(exc)}
+
+
+def page_graph():
+    st.title("🕸️ Graph Structure")
+    st.markdown(
+        "How the heterogeneous graph fed to **ST-HeteroSAGE** is constructed — "
+        "**2 node types** (`hour`, `market`) and **5 edge relation types**. "
+        "The schematic below needs no model files; the statistics and the "
+        "interactive mini-graph load the real `hetero_graph.pt`."
+    )
+
+    g = _load_hetero_graph()
+    graph_ok = not (isinstance(g, dict) and "_error" in g)
+    if not graph_ok:
+        st.warning(
+            f"Could not load `{GRAPH_PATH.name}` "
+            f"({g.get('_error', 'missing')}). The schematic still renders below; "
+            "run `python src/hetero_graph_builder.py` to enable the live sections."
+        )
+
+    # ---- 1. Live statistics ----------------------------------------------
+    st.subheader("1. Graph statistics")
+    if graph_ok:
+        node_rows = []
+        for ntype in g.node_types:
+            n = g[ntype].num_nodes
+            f = g[ntype].x.shape[1] if getattr(g[ntype], "x", None) is not None else 0
+            node_rows.append({"Node type": ntype, "# nodes": f"{n:,}", "# features": f})
+
+        edge_rows = []
+        for src, rel, dst in g.edge_types:
+            ei = g[src, rel, dst].edge_index
+            edge_rows.append({
+                "Direction": f"{src} → {dst}", "Relation": rel,
+                "# edges": f"{ei.shape[1]:,}",
+            })
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Node types**")
+            st.dataframe(pd.DataFrame(node_rows), use_container_width=True, hide_index=True)
+        with c2:
+            st.markdown("**Edge relation types**")
+            st.dataframe(pd.DataFrame(edge_rows), use_container_width=True, hide_index=True)
+
+        T = int(g["hour"].num_hours_per_zone)
+        total_nodes = sum(g[nt].num_nodes for nt in g.node_types)
+        total_edges = sum(g[et].edge_index.shape[1] for et in g.edge_types)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total nodes", f"{total_nodes:,}")
+        m2.metric("Total edges", f"{total_edges:,}")
+        m3.metric("Hours per zone (T)", f"{T:,}")
+    else:
+        st.info("Live statistics unavailable — graph file not loaded.")
+
+    # ---- 2. Schematic topology -------------------------------------------
+    st.subheader("2. Schematic topology")
+    st.caption("One representative node per zone / market — positions chosen for clarity, not geometry.")
+
+    node_defs = [
+        ("DK1\nhour",   -1.5,  1.0, ZONE_COLORS["DK1"],   30, "hour"),
+        ("DK2\nhour",   -0.5,  1.0, ZONE_COLORS["DK2"],   30, "hour"),
+        ("HYDRO\nhour",  0.5,  1.0, ZONE_COLORS["HYDRO"], 30, "hour"),
+        ("DE\nhour",     1.5,  1.0, ZONE_COLORS["DE"],    30, "hour"),
+        ("NordPool",    -1.0, -0.5, "#9467bd", 22, "market"),
+        ("DK1 area",    -0.33,-0.5, "#8c564b", 22, "market"),
+        ("DK2 area",     0.33,-0.5, "#e377c2", 22, "market"),
+        ("DE area",      1.0, -0.5, "#7f7f7f", 22, "market"),
+    ]
+    edge_defs = [
+        (0, 1, "co_occurs_with", "#aec7e8", "solid"),
+        (0, 2, "co_occurs_with", "#aec7e8", "solid"),
+        (1, 2, "co_occurs_with", "#aec7e8", "solid"),
+        (0, 0, "lag_to (self)",  "#9ecae1", "dot"),
+        (0, 4, "belongs_to",     "#c5b0d5", "dash"),
+        (1, 5, "belongs_to",     "#c5b0d5", "dash"),
+        (2, 5, "belongs_to",     "#c5b0d5", "dash"),
+        (3, 7, "belongs_to",     "#c5b0d5", "dash"),
+        (4, 5, "interconnects",  "#ffbb78", "solid"),
+        (5, 6, "interconnects",  "#ffbb78", "solid"),
+    ]
+
+    fig = go.Figure()
+    drawn = set()
+    for fi, ti, lbl, col, dash in edge_defs:
+        if fi == ti:
+            x0, y0 = node_defs[fi][1], node_defs[fi][2]
+            fig.add_annotation(ax=x0, ay=y0 + 0.18, x=x0 + 0.18, y=y0,
+                               xref="x", yref="y", axref="x", ayref="y",
+                               showarrow=True, arrowhead=2, arrowcolor=col, arrowwidth=1.5)
+            continue
+        x0, y0 = node_defs[fi][1], node_defs[fi][2]
+        x1, y1 = node_defs[ti][1], node_defs[ti][2]
+        show = lbl not in drawn
+        drawn.add(lbl)
+        fig.add_trace(go.Scatter(
+            x=[x0, x1], y=[y0, y1], mode="lines",
+            line=dict(color=col, width=2, dash=dash if dash in ("dash", "dot") else "solid"),
+            name=lbl, showlegend=show, hoverinfo="name",
+        ))
+    for lbl, x, y, col, sz, ntype in node_defs:
+        fig.add_trace(go.Scatter(
+            x=[x], y=[y], mode="markers+text",
+            marker=dict(color=col, size=sz, line=dict(color="white", width=2)),
+            text=[lbl], textposition="top center", showlegend=False,
+            hovertemplate=f"<b>{lbl.replace(chr(10), ' ')}</b><br>type: {ntype}<extra></extra>",
+        ))
+    for col, label in [(ZONE_COLORS["DK1"], "hour (DK1)"), (ZONE_COLORS["DK2"], "hour (DK2)"),
+                       (ZONE_COLORS["HYDRO"], "hour (HYDRO)"), (ZONE_COLORS["DE"], "hour (DE)"),
+                       ("#9467bd", "market node")]:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(color=col, size=12), name=label, showlegend=True,
+        ))
+    fig.update_layout(
+        title="Heterogeneous graph — schematic topology",
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-2.2, 2.2]),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.2, 1.6]),
+        height=520, plot_bgcolor="white",
+        legend=dict(x=1.01, y=0.99, bordercolor="lightgray", borderwidth=1),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ---- 3. Interactive mini-graph ---------------------------------------
+    st.subheader("3. Interactive mini-graph")
+    if not graph_ok:
+        st.info("Mini-graph unavailable — graph file not loaded.")
+        return
+
+    st.caption("A real slice of the graph: a few timesteps per zone plus the market nodes. Hover any node for its features.")
+    T = int(g["hour"].num_hours_per_zone)
+    M = g["market"].num_nodes
+    n_steps = st.slider("Timesteps per zone", min_value=2, max_value=5, value=3)
+
+    t_center = T // 2
+    half = n_steps // 2
+    steps = list(range(t_center - half, t_center - half + n_steps))
+    zones = ["DK1", "DK2", "HYDRO", "DE"]
+    m_colors = ["#9467bd", "#8c564b", "#e377c2", "#7f7f7f"]
+    mkt_names = ["NordPool", "DK1 area", "DK2 area", "DE area"]
+
+    hour_nodes, market_nodes = {}, {}
+    positions, labels, colors_, hovers = {}, {}, {}, {}
+    mid = 0
+    for zi, z in enumerate(zones):
+        for ci, t in enumerate(steps):
+            gidx = zi * T + t
+            hour_nodes[gidx] = mid
+            positions[mid] = (ci * 2.0, -zi * 1.5)
+            labels[mid] = f"{z}\nt={t}"
+            colors_[mid] = ZONE_COLORS[z]
+            feat = g["hour"].x[gidx].tolist()
+            hovers[mid] = (
+                f"<b>{z} t={t}</b><br>lag_24h: {feat[0]:.2f}<br>"
+                f"lag_48h: {feat[1]:.2f}<br>wind: {feat[6]:.2f}<br>"
+                f"hour_sin: {feat[13]:.2f}"
+            )
+            mid += 1
+    for mi in range(min(M, 4)):
+        market_nodes[mi] = mid
+        positions[mid] = (mi * 2.0, -len(zones) * 1.5 - 0.8)
+        labels[mid] = mkt_names[mi] if mi < len(mkt_names) else f"Market {mi}"
+        colors_[mid] = m_colors[mi % len(m_colors)]
+        hovers[mid] = f"<b>{labels[mid]}</b><br>type: market"
+        mid += 1
+
+    rel_colors = {
+        "lag_to": "#9ecae1", "co_occurs_with": "#a1d99b", "belongs_to": "#c5b0d5",
+        "rev_belongs_to": "#dadaeb", "interconnects": "#ffbb78",
+    }
+    edge_traces, drawn_rels = [], set()
+    for src_type, rel, dst_type in g.edge_types:
+        ei = g[src_type, rel, dst_type].edge_index
+        src_map = hour_nodes if src_type == "hour" else market_nodes
+        dst_map = hour_nodes if dst_type == "hour" else market_nodes
+        ex, ey = [], []
+        for s, d in zip(ei[0].tolist(), ei[1].tolist()):
+            if s in src_map and d in dst_map:
+                x0, y0 = positions[src_map[s]]
+                x1, y1 = positions[dst_map[d]]
+                ex += [x0, x1, None]
+                ey += [y0, y1, None]
+        if not ex:
+            continue
+        show = rel not in drawn_rels
+        drawn_rels.add(rel)
+        edge_traces.append(go.Scatter(
+            x=ex, y=ey, mode="lines",
+            line=dict(color=rel_colors.get(rel, "#cccccc"), width=1.5),
+            opacity=0.7, name=rel, showlegend=show, hoverinfo="none",
+        ))
+
+    node_scatter = go.Scatter(
+        x=[positions[i][0] for i in range(mid)],
+        y=[positions[i][1] for i in range(mid)],
+        mode="markers+text",
+        marker=dict(color=[colors_[i] for i in range(mid)], size=20,
+                    line=dict(color="white", width=1.5)),
+        text=[labels[i] for i in range(mid)], textposition="top center",
+        customdata=[hovers[i] for i in range(mid)],
+        hovertemplate="%{customdata}<extra></extra>", showlegend=False,
+    )
+    fig2 = go.Figure(edge_traces + [node_scatter])
+    fig2.update_layout(
+        title=f"Interactive mini-graph ({mid} nodes, {n_steps} timesteps per zone)",
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        height=560, plot_bgcolor="white", hovermode="closest",
+        legend=dict(x=1.01, y=0.99, bordercolor="lightgray", borderwidth=1),
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+    st.caption(f"Nodes shown: {mid}  |  Edge sets drawn: {len(drawn_rels)}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -727,6 +954,7 @@ def main():
         "Navigate",
         [
             "📊 Overview & Leaderboard",
+            "🕸️ Graph Structure",
             "🔮 Live Prediction",
             "📈 Forecast Analysis",
             "🔍 Interpretability",
@@ -739,6 +967,8 @@ def main():
 
     if page == "📊 Overview & Leaderboard":
         page_overview()
+    elif page == "🕸️ Graph Structure":
+        page_graph()
     elif page == "🔮 Live Prediction":
         page_predict(api_up)
     elif page == "📈 Forecast Analysis":
