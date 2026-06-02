@@ -269,14 +269,18 @@ def page_predict(api_up):
             lag_24h = st.number_input("lag_24h (DKK)", value=500.0, step=10.0)
             lag_48h = st.number_input("lag_48h (DKK)", value=510.0, step=10.0)
             lag_168h = st.number_input("lag_168h (DKK)", value=480.0, step=10.0)
-        with c2:
             rolling_24h_mean = st.number_input("rolling_24h_mean (DKK)", value=495.0, step=10.0)
             rolling_24h_std = st.number_input("rolling_24h_std (DKK)", value=60.0, step=5.0)
+        with c2:
             temperature_c = st.number_input("temperature_c (°C)", value=8.0, step=0.5)
             wind_speed_ms = st.number_input("wind_speed_ms (m/s)", value=6.0, step=0.5)
-        with c3:
             cloud_cover_pct = st.number_input("cloud_cover_pct (%)", value=50.0, min_value=0.0, max_value=100.0, step=5.0)
             humidity_pct = st.number_input("humidity_pct (%)", value=70.0, min_value=0.0, max_value=100.0, step=5.0)
+        with c3:
+            load_mwh = st.number_input("load_mwh (MWh)", value=3500.0, step=100.0)
+            renewable_mwh = st.number_input("renewable_mwh (MWh)", value=1500.0, step=100.0)
+            gas_dkk = st.number_input("gas_dkk (DKK/MWh)", value=300.0, step=10.0)
+            co2_dkk = st.number_input("co2_dkk (DKK/tonne)", value=80.0, step=5.0)
             hour_of_day = st.slider("hour_of_day", 0, 23, 18)
             day_of_week = st.slider("day_of_week (0=Mon)", 0, 6, 0)
 
@@ -294,6 +298,10 @@ def page_predict(api_up):
             "wind_speed_ms": wind_speed_ms,
             "cloud_cover_pct": cloud_cover_pct,
             "humidity_pct": humidity_pct,
+            "load_mwh": load_mwh,
+            "renewable_mwh": renewable_mwh,
+            "gas_dkk": gas_dkk,
+            "co2_dkk": co2_dkk,
             "hour_of_day": hour_of_day,
             "day_of_week": day_of_week,
         }
