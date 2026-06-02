@@ -4,10 +4,14 @@ pandas>=2.0.0
 scikit-learn>=1.3.0
 
 # PyTorch and PyTorch Geometric
+# Note: torch-scatter / torch-sparse are intentionally NOT pinned here.
+# PyG >=2.3 implements scatter/segment ops natively via torch.scatter_reduce,
+# and the conv layers used in this project (SAGEConv, GATConv, GCNConv,
+# GINConv, HeteroConv, global_mean_pool) need no compiled extensions.
+# Pinning them breaks `pip install` because their setup.py imports torch
+# before torch is available in the same build pass.
 torch>=2.0.0
 torch-geometric>=2.3.0
-torch-scatter>=2.1.0
-torch-sparse>=0.6.0
 
 # ML models
 xgboost>=2.0.0
