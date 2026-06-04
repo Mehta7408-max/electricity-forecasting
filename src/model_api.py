@@ -39,6 +39,12 @@ SPATIAL_EDGE_TYPES = [
     ('market', 'interconnects',  'market'),
 ]
 
+# Per-zone training stats for load/renewable z-scoring (from hetero_pipeline.py, 80% train split)
+_ZONE_LOAD_STATS = {
+    "DK1": {"load_mwh": (2615.27, 505.81),  "renewable_mwh": (1760.94, 1181.19)},
+    "DK2": {"load_mwh": (1566.48, 307.03),  "renewable_mwh": (619.19,  452.03)},
+}
+
 app = FastAPI(
     title="Electricity Price Forecasting API",
     description="ST-HeteroSAGE (CausalTCN + HeteroConv) — DK1 & DK2 zones",
@@ -119,7 +125,20 @@ async def load_model():
 class PredictRequest(BaseModel):
     zone: str = Field(..., description="DK1 or DK2")
     hour_of_day: int = Field(..., ge=0, le=23, description="Target hour of day (0–23)")
-    day_of_week: int = Field(default=0, ge=0, le=6, description="Day of week (unused, kept for compatibility)")
+    day_of_week: int = Field(default=1, ge=0, le=6, description="Day of week (Mon=0, Sun=6)")
+    lag_24h: float = Field(default=800.0, description="Price lag 24 h (DKK)")
+    lag_48h: float = Field(default=750.0, description="Price lag 48 h (DKK)")
+    lag_168h: float = Field(default=720.0, description="Price lag 168 h / 1-week (DKK)")
+    roll_mean: float = Field(default=750.0, description="24 h rolling mean price (DKK)")
+    roll_std: float = Field(default=150.0, description="24 h rolling std price (DKK)")
+    temp_c: float = Field(default=10.0, description="Temperature (°C)")
+    wind_ms: float = Field(default=6.0, description="Wind speed (m/s)")
+    cloud_pct: float = Field(default=50.0, description="Cloud cover (%)")
+    humidity_pct: float = Field(default=75.0, description="Humidity (%)")
+    load_mwh: float = Field(default=2600.0, description="Load (MWh)")
+    renewable_mwh: float = Field(default=1700.0, description="Renewable generation (MWh)")
+    gas_dkk: float = Field(default=400.0, description="Gas price (DKK/MWh)")
+    co2_dkk: float = Field(default=200.0, description="CO2 price (DKK/t)")
 
 
 class PredictResponse(BaseModel):
@@ -154,25 +173,40 @@ def predict(req: PredictRequest):
 
     try:
         import torch
-        import pandas as pd
 
         T = _num_hours
         zone_offset = 0 if zone == "DK1" else T
 
-        # Find most-recent test node with matching hour_of_day
-        test_mask = _hetero_data['hour'].test_mask.cpu().numpy()
-        start_ts = pd.Timestamp("2019-12-31 23:00:00")
-        t_indices = np.arange(T)
-        hours_arr = (start_ts + pd.to_timedelta(t_indices, unit='h')).hour.to_numpy()
-        hour_match = hours_arr == req.hour_of_day
-        zone_test = test_mask[zone_offset: zone_offset + T]
-        candidates = np.where(zone_test & hour_match)[0]
-        if len(candidates) == 0:
-            candidates = np.where(zone_test)[0]
-        node_idx = zone_offset + int(candidates[-1])
+        # Per-zone z-score for load/renewable (matches hetero_pipeline.py)
+        zs = _ZONE_LOAD_STATS[zone]
+        z_load = (req.load_mwh - zs["load_mwh"][0]) / zs["load_mwh"][1]
+        z_ren  = (req.renewable_mwh - zs["renewable_mwh"][0]) / zs["renewable_mwh"][1]
 
-        x_dict = {'hour': _hetero_data['hour'].x.to(_device),
-                  'market': _hetero_data['market'].x.to(_device)}
+        # Cyclical calendar features
+        h_sin = math.sin(2 * math.pi * req.hour_of_day / 24.0)
+        h_cos = math.cos(2 * math.pi * req.hour_of_day / 24.0)
+        w_sin = math.sin(2 * math.pi * req.day_of_week / 7.0)
+        w_cos = math.cos(2 * math.pi * req.day_of_week / 7.0)
+
+        # 17-feature vector matching hetero_graph_builder.py column order
+        raw = np.array([[req.lag_24h, req.lag_48h, req.lag_168h,
+                         req.roll_mean, req.roll_std,
+                         req.temp_c, req.wind_ms, req.cloud_pct, req.humidity_pct,
+                         z_load, z_ren, req.gas_dkk, req.co2_dkk,
+                         h_sin, h_cos, w_sin, w_cos]], dtype=np.float32)
+
+        from sklearn.preprocessing import StandardScaler  # already imported at startup
+        scaled = _scalers["feature_scaler"].transform(raw)
+
+        # Override the last test node in this zone with the user feature vector
+        test_mask = _hetero_data['hour'].test_mask.cpu().numpy()
+        zone_test = test_mask[zone_offset: zone_offset + T]
+        node_idx = zone_offset + int(np.where(zone_test)[0][-1])
+
+        x_hour = _hetero_data['hour'].x.clone().to(_device)
+        x_hour[node_idx] = torch.tensor(scaled[0], dtype=torch.float32).to(_device)
+        x_dict = {'hour': x_hour, 'market': _hetero_data['market'].x.to(_device)}
+
         with torch.no_grad():
             out = _model(x_dict, _edge_index_dict)
 
