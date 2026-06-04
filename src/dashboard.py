@@ -306,61 +306,65 @@ def _load_st_local():
     return model, data, scalers, target_scaler, edge_index_dict, T, device
 
 
-def _predict_local_st(req):
-    """Run ST-HeteroSAGE inference locally. Returns (price_dkk, error_str)."""
+def _predict_local_st(zone: str, hour_of_day: int):
+    """
+    Run ST-HeteroSAGE on the most-recent test node for (zone, hour_of_day).
+    Returns (price_dkk, feature_dict, timestamp_str, error_str).
+    Uses actual graph features — no manual feature override or broken scaler.
+    """
     try:
         import torch
+        import pandas as pd
 
         loaded = _load_st_local()
-        if loaded is None:
-            return None, "ST-HeteroSAGE model files not found"
-
         model, data, scalers, target_scaler, edge_index_dict, T, device = loaded
 
-        zone = req.get("zone", "DK1").upper()
-        hour_of_day = req.get("hour_of_day", 12)
-        day_of_week = req.get("day_of_week", 0)
-
-        hour_sin = math.sin(2 * math.pi * hour_of_day / 24.0)
-        hour_cos = math.cos(2 * math.pi * hour_of_day / 24.0)
-        week_sin = math.sin(2 * math.pi * day_of_week / 7.0)
-        week_cos = math.cos(2 * math.pi * day_of_week / 7.0)
-
-        raw_features = np.array([[
-            req.get("lag_24h", 300.0), req.get("lag_48h", 300.0), req.get("lag_168h", 300.0),
-            req.get("rolling_24h_mean", 300.0), req.get("rolling_24h_std", 50.0),
-            req.get("temperature_c", 10.0), req.get("wind_speed_ms", 5.0),
-            req.get("cloud_cover_pct", 50.0), req.get("humidity_pct", 70.0),
-            req.get("load_mwh", 3500.0), req.get("renewable_mwh", 1500.0),
-            req.get("gas_dkk", 300.0), req.get("co2_dkk", 80.0),
-            hour_sin, hour_cos, week_sin, week_cos,
-        ]], dtype=np.float32)
-
-        scaled_features = scalers["feature_scaler"].transform(raw_features)
-
-        # Override the last node in the zone with the user's features
-        x_dict = {k: v.clone() for k, v in data.x_dict.items()}
+        zone = zone.upper()
         zone_offset = 0 if zone == "DK1" else T
-        node_idx = zone_offset + T - 1
-        x_dict["hour"][node_idx] = torch.tensor(scaled_features[0], dtype=torch.float32)
-        x_dict = {k: v.to(device) for k, v in x_dict.items()}
 
+        # Find test nodes for this zone with matching hour_of_day
+        test_mask = data['hour'].test_mask.numpy()
+        start_ts = pd.Timestamp("2019-12-31 23:00:00")
+        t_indices = np.arange(T)
+        hours_arr = ((start_ts + pd.to_timedelta(t_indices, unit='h'))
+                     .hour.to_numpy())
+        hour_match = hours_arr == hour_of_day
+        zone_test = test_mask[zone_offset: zone_offset + T]
+        candidates = np.where(zone_test & hour_match)[0]
+        if len(candidates) == 0:
+            candidates = np.where(zone_test)[0]
+        t_local = int(candidates[-1])
+        node_idx = zone_offset + t_local
+
+        # Inference — no feature override; graph features are already scaled
+        x_dict = {'hour': data['hour'].x.to(device),
+                  'market': data['market'].x.to(device)}
         with torch.no_grad():
             out = model(x_dict, edge_index_dict)
+        predicted_dkk = float(
+            target_scaler.inverse_transform([[out[node_idx].item()]])[0][0])
 
-        predicted_dkk = float(target_scaler.inverse_transform([[out[node_idx].item()]])[0][0])
-        return predicted_dkk, None
+        # Inverse-transform first 13 features to physical units for display
+        fs = scalers["feature_scaler"]
+        raw_row = fs.inverse_transform(
+            data['hour'].x[node_idx].numpy().reshape(1, -1))[0]
+        feat_names = ['lag_24h', 'lag_48h', 'lag_168h', 'roll_mean', 'roll_std',
+                      'temp_c', 'wind_ms', 'cloud_pct', 'humidity_pct',
+                      'load_mwh', 'renewable_mwh', 'gas_dkk', 'co2_dkk']
+        feat_dict = {n: float(raw_row[i]) for i, n in enumerate(feat_names)}
+        ts_str = str(start_ts + pd.Timedelta(hours=int(t_local)))
+        return predicted_dkk, feat_dict, ts_str, None
 
     except Exception as exc:
-        return None, str(exc)
+        return None, {}, "", str(exc)
 
 
 def page_predict(api_up):
     st.title("🔮 Live Prediction")
     st.markdown(
-        "Single-step day-ahead price forecast using **ST-HeteroSAGE** (MAE ≈ 151 DKK). "
-        "When the FastAPI server is running, the request is forwarded to the API; "
-        "otherwise the model runs locally inside the dashboard."
+        "Day-ahead price forecast using **ST-HeteroSAGE** (MAE ≈ 151 DKK). "
+        "Select a zone and target hour — the model runs on the most recent "
+        "matching node from the test set using its actual graph features."
     )
 
     if api_up:
@@ -372,48 +376,15 @@ def page_predict(api_up):
         )
 
     with st.form("predict_form"):
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         with c1:
             zone = st.selectbox("Zone", ["DK1", "DK2"])
-            lag_24h = st.number_input("lag_24h (DKK)", value=500.0, step=10.0)
-            lag_48h = st.number_input("lag_48h (DKK)", value=510.0, step=10.0)
-            lag_168h = st.number_input("lag_168h (DKK)", value=480.0, step=10.0)
-            rolling_24h_mean = st.number_input("rolling_24h_mean (DKK)", value=495.0, step=10.0)
-            rolling_24h_std = st.number_input("rolling_24h_std (DKK)", value=60.0, step=5.0)
         with c2:
-            temperature_c = st.number_input("temperature_c (°C)", value=8.0, step=0.5)
-            wind_speed_ms = st.number_input("wind_speed_ms (m/s)", value=6.0, step=0.5)
-            cloud_cover_pct = st.number_input("cloud_cover_pct (%)", value=50.0, min_value=0.0, max_value=100.0, step=5.0)
-            humidity_pct = st.number_input("humidity_pct (%)", value=70.0, min_value=0.0, max_value=100.0, step=5.0)
-        with c3:
-            load_mwh = st.number_input("load_mwh (MWh)", value=3500.0, step=100.0)
-            renewable_mwh = st.number_input("renewable_mwh (MWh)", value=1500.0, step=100.0)
-            gas_dkk = st.number_input("gas_dkk (DKK/MWh)", value=300.0, step=10.0)
-            co2_dkk = st.number_input("co2_dkk (DKK/tonne)", value=80.0, step=5.0)
-            hour_of_day = st.slider("hour_of_day", 0, 23, 18)
-            day_of_week = st.slider("day_of_week (0=Mon)", 0, 6, 0)
-
+            hour_of_day = st.slider("Target hour of day", 0, 23, 18)
         submitted = st.form_submit_button("Predict price", type="primary")
 
     if submitted:
-        payload = {
-            "zone": zone,
-            "lag_24h": lag_24h,
-            "lag_48h": lag_48h,
-            "lag_168h": lag_168h,
-            "rolling_24h_mean": rolling_24h_mean,
-            "rolling_24h_std": rolling_24h_std,
-            "temperature_c": temperature_c,
-            "wind_speed_ms": wind_speed_ms,
-            "cloud_cover_pct": cloud_cover_pct,
-            "humidity_pct": humidity_pct,
-            "load_mwh": load_mwh,
-            "renewable_mwh": renewable_mwh,
-            "gas_dkk": gas_dkk,
-            "co2_dkk": co2_dkk,
-            "hour_of_day": hour_of_day,
-            "day_of_week": day_of_week,
-        }
+        payload = {"zone": zone, "hour_of_day": hour_of_day, "day_of_week": 0}
         result = api_post("/predict", payload) if api_up else None
 
         if result is not None and "_error" not in result:
@@ -427,15 +398,27 @@ def page_predict(api_up):
                     f"API error {result['_error']}: {result.get('detail')} — "
                     "running ST-HeteroSAGE locally."
                 )
-            pred, err = _predict_local_st(payload)
+            pred, feats, ts_str, err = _predict_local_st(zone, hour_of_day)
             if pred is None:
-                st.error(f"Local ST-HeteroSAGE inference failed: {err}")
+                st.error(f"ST-HeteroSAGE inference failed: {err}")
             else:
                 st.metric(
                     f"Predicted price — {zone}  (ST-HeteroSAGE local)",
                     f"{pred:.2f} DKK",
                 )
-                st.caption("MAE ≈ 151 DKK on the DK1+DK2 test set.")
+                st.caption(f"Test node: {ts_str}  |  MAE ≈ 151 DKK on DK1+DK2 test set.")
+                if feats:
+                    st.subheader("Features used (actual test data)")
+                    fc1, fc2, fc3 = st.columns(3)
+                    fc1.metric("lag_24h", f"{feats['lag_24h']:.1f} DKK")
+                    fc1.metric("lag_48h", f"{feats['lag_48h']:.1f} DKK")
+                    fc1.metric("lag_168h", f"{feats['lag_168h']:.1f} DKK")
+                    fc2.metric("Temperature", f"{feats['temp_c']:.1f} °C")
+                    fc2.metric("Wind", f"{feats['wind_ms']:.1f} m/s")
+                    fc2.metric("Cloud cover", f"{feats['cloud_pct']:.0f} %")
+                    fc3.metric("Gas price", f"{feats['gas_dkk']:.1f} DKK/MWh")
+                    fc3.metric("CO₂ price", f"{feats['co2_dkk']:.1f} DKK/t")
+                    fc3.metric("Renewable", f"{feats['renewable_mwh']:.0f} MWh")
 
 
 # ---------------------------------------------------------------------------
