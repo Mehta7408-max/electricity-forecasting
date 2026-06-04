@@ -16,3 +16,6 @@ mlruns/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
+
+# generated PDF report
+FINAL_REPORT.pdf
