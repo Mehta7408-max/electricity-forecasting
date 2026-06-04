@@ -140,17 +140,32 @@ fig.tight_layout(rect=[0, 0, 1, 0.96])
 fig.savefig(OUT / "05_ablation.png", dpi=200, bbox_inches="tight")
 plt.close("all")
 
-# 6) Feature importance (homogeneous interpretability, DK1 & DK2)
-interp = load(ROOT / "src/artifacts_hetero/interpretability_summary.json")
-fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-for ax, zone in zip(axes, ["DK1", "DK2"]):
-    fi = interp["feature_importance"][zone]
-    items = sorted(fi.items(), key=lambda kv: kv[1])
-    feats = [k for k, _ in items]; vals = [v for _, v in items]
-    ax.barh(feats, vals, color="#9467bd", alpha=0.85, edgecolor="black")
-    ax.set_title(f"{zone} – Feature Importance", fontsize=13, fontweight="bold")
-    ax.set_xlabel("Relative importance")
-    ax.grid(True, alpha=0.3, axis="x")
+# 6) Feature importance from the best model (ST-HeteroSAGE), which includes the
+# fuel/market features. Fuel/market & load/generation features are highlighted.
+st_interp = load(ROOT / "src/artifacts_hetero/st_interpretability.json")
+fi = st_interp["feature_importance"]
+items = sorted(fi, key=lambda d: d["importance"])  # ascending for horizontal bars
+feats = [d["feature"] for d in items]
+raw = np.array([d["importance"] for d in items], dtype=float)
+vals = raw / raw.max() * 100.0  # normalize to % of the top feature
+
+fuel_market = {"gas_dkk", "co2_dkk", "load_mwh", "renewable_mwh"}
+colors = ["#d62728" if f in fuel_market else "#9467bd" for f in feats]
+
+fig, ax = plt.subplots(figsize=(11, 8))
+bars = ax.barh(feats, vals, color=colors, alpha=0.9, edgecolor="black")
+for b, v in zip(bars, vals):
+    ax.text(b.get_width() + 1, b.get_y() + b.get_height() / 2, f"{v:.0f}",
+            va="center", fontsize=9)
+ax.set_title("ST-HeteroSAGE – Feature Importance (fuel/market in red)",
+             fontsize=14, fontweight="bold")
+ax.set_xlabel("Relative importance (% of top feature)")
+ax.set_xlim(0, 112)
+ax.grid(True, alpha=0.3, axis="x")
+from matplotlib.patches import Patch
+ax.legend(handles=[Patch(facecolor="#d62728", label="Fuel / market / load / generation"),
+                   Patch(facecolor="#9467bd", label="Price-lag / weather / calendar")],
+          loc="lower right")
 fig.tight_layout()
 fig.savefig(OUT / "06_feature_importance.png", dpi=200, bbox_inches="tight")
 plt.close("all")
