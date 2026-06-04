@@ -313,6 +313,41 @@ def _load_st_local():
     return model, data, scalers, target_scaler, edge_index_dict, T, device
 
 
+def _predict_local_st_simple(zone: str, hour_of_day: int):
+    """
+    Run ST-HeteroSAGE on the most-recent test node for (zone, hour_of_day)
+    using the actual graph features from the last pipeline run.
+    Returns (price_dkk, error_str).
+    """
+    try:
+        import torch
+        import pandas as pd
+
+        loaded = _load_st_local()
+        model, data, scalers, target_scaler, edge_index_dict, T, device = loaded
+
+        zone = zone.upper()
+        zone_offset = 0 if zone == "DK1" else T
+
+        test_mask = data['hour'].test_mask.numpy()
+        start_ts = pd.Timestamp("2019-12-31 23:00:00")
+        hours_arr = ((start_ts + pd.to_timedelta(np.arange(T), unit='h')).hour.to_numpy())
+        zone_test = test_mask[zone_offset: zone_offset + T]
+        candidates = np.where(zone_test & (hours_arr == hour_of_day))[0]
+        if len(candidates) == 0:
+            candidates = np.where(zone_test)[0]
+        node_idx = zone_offset + int(candidates[-1])
+
+        x_dict = {'hour': data['hour'].x.to(device), 'market': data['market'].x.to(device)}
+        with torch.no_grad():
+            out = model(x_dict, edge_index_dict)
+        predicted_dkk = float(target_scaler.inverse_transform([[out[node_idx].item()]])[0][0])
+        return predicted_dkk, None
+
+    except Exception as exc:
+        return None, str(exc)
+
+
 def _predict_local_st(zone: str, hour_of_day: int, day_of_week: int,
                       lag_24h: float, lag_48h: float, lag_168h: float,
                       roll_mean: float, roll_std: float,
@@ -375,8 +410,8 @@ def _predict_local_st(zone: str, hour_of_day: int, day_of_week: int,
 def page_predict(api_up):
     st.title("🔮 Live Prediction")
     st.markdown(
-        "Day-ahead price forecast using **ST-HeteroSAGE** (MAE ≈ 151 DKK on DK1+DK2 test set). "
-        "Enter all input features — defaults are representative Danish market values."
+        "Day-ahead price forecast using **ST-HeteroSAGE** (MAE ≈ 151 DKK). "
+        "Pick a zone and target hour — the model uses the most recent data from the pipeline."
     )
 
     if api_up:
@@ -388,51 +423,62 @@ def page_predict(api_up):
         )
 
     with st.form("predict_form"):
-        st.subheader("Zone & time")
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         with c1:
             zone = st.selectbox("Zone", ["DK1", "DK2"])
         with c2:
-            hour_of_day = st.slider("Hour of day (0–23)", 0, 23, 18)
-        with c3:
+            hour_of_day = st.slider("Target hour of day (0–23)", 0, 23, 18)
+
+        # What-if overrides — collapsed by default; most users never need these
+        with st.expander("What-if feature overrides (optional — advanced analysis only)"):
+            st.caption(
+                "Leave blank / at defaults to use the actual pipeline features. "
+                "Override individual values to run sensitivity / scenario analysis."
+            )
             day_of_week = st.slider("Day of week (Mon=0, Sun=6)", 0, 6, 1)
 
-        st.subheader("Price lags & rolling stats (DKK)")
-        p1, p2, p3, p4, p5 = st.columns(5)
-        lag_24h    = p1.number_input("lag t−24 h",       value=800.0,  step=10.0, format="%.1f")
-        lag_48h    = p2.number_input("lag t−48 h",       value=750.0,  step=10.0, format="%.1f")
-        lag_168h   = p3.number_input("lag t−168 h (1 wk)", value=720.0, step=10.0, format="%.1f")
-        roll_mean  = p4.number_input("24 h rolling mean", value=750.0,  step=10.0, format="%.1f")
-        roll_std   = p5.number_input("24 h rolling std",  value=150.0,  step=5.0,  format="%.1f")
+            st.markdown("**Price lags & rolling stats (DKK)**")
+            p1, p2, p3, p4, p5 = st.columns(5)
+            lag_24h    = p1.number_input("lag t−24 h",          value=800.0,  step=10.0, format="%.1f")
+            lag_48h    = p2.number_input("lag t−48 h",          value=750.0,  step=10.0, format="%.1f")
+            lag_168h   = p3.number_input("lag t−168 h (1 wk)",  value=720.0,  step=10.0, format="%.1f")
+            roll_mean  = p4.number_input("24 h rolling mean",   value=750.0,  step=10.0, format="%.1f")
+            roll_std   = p5.number_input("24 h rolling std",    value=150.0,  step=5.0,  format="%.1f")
 
-        st.subheader("Weather")
-        w1, w2, w3, w4 = st.columns(4)
-        temp_c       = w1.number_input("Temperature (°C)",  value=10.0,  step=1.0,  format="%.1f")
-        wind_ms      = w2.number_input("Wind speed (m/s)",  value=6.0,   step=0.5,  format="%.1f")
-        cloud_pct    = w3.number_input("Cloud cover (%)",   value=50.0,  step=5.0,  format="%.1f",
-                                       min_value=0.0, max_value=100.0)
-        humidity_pct = w4.number_input("Humidity (%)",      value=75.0,  step=5.0,  format="%.1f",
-                                       min_value=0.0, max_value=100.0)
+            st.markdown("**Weather**")
+            w1, w2, w3, w4 = st.columns(4)
+            temp_c       = w1.number_input("Temperature (°C)",   value=10.0, step=1.0,  format="%.1f")
+            wind_ms      = w2.number_input("Wind speed (m/s)",   value=6.0,  step=0.5,  format="%.1f")
+            cloud_pct    = w3.number_input("Cloud cover (%)",    value=50.0, step=5.0,  format="%.1f",
+                                           min_value=0.0, max_value=100.0)
+            humidity_pct = w4.number_input("Humidity (%)",       value=75.0, step=5.0,  format="%.1f",
+                                           min_value=0.0, max_value=100.0)
 
-        st.subheader("Fundamentals")
-        f1, f2, f3, f4 = st.columns(4)
-        load_mwh      = f1.number_input("Load (MWh)",            value=2600.0, step=50.0, format="%.0f")
-        renewable_mwh = f2.number_input("Renewable gen (MWh)",   value=1700.0, step=50.0, format="%.0f")
-        gas_dkk       = f3.number_input("Gas price (DKK/MWh)",   value=400.0,  step=10.0, format="%.1f")
-        co2_dkk       = f4.number_input("CO₂ price (DKK/t)",     value=200.0,  step=5.0,  format="%.1f")
+            st.markdown("**Fundamentals**")
+            f1, f2, f3, f4 = st.columns(4)
+            load_mwh      = f1.number_input("Load (MWh)",            value=2600.0, step=50.0, format="%.0f")
+            renewable_mwh = f2.number_input("Renewable gen (MWh)",   value=1700.0, step=50.0, format="%.0f")
+            gas_dkk       = f3.number_input("Gas price (DKK/MWh)",   value=400.0,  step=10.0, format="%.1f")
+            co2_dkk       = f4.number_input("CO₂ price (DKK/t)",     value=200.0,  step=5.0,  format="%.1f")
+
+            use_overrides = st.checkbox("Apply these overrides to the prediction", value=False)
 
         submitted = st.form_submit_button("Predict price", type="primary")
 
     if submitted:
-        payload = {
-            "zone": zone, "hour_of_day": hour_of_day, "day_of_week": day_of_week,
-            "lag_24h": lag_24h, "lag_48h": lag_48h, "lag_168h": lag_168h,
-            "roll_mean": roll_mean, "roll_std": roll_std,
-            "temp_c": temp_c, "wind_ms": wind_ms,
-            "cloud_pct": cloud_pct, "humidity_pct": humidity_pct,
-            "load_mwh": load_mwh, "renewable_mwh": renewable_mwh,
-            "gas_dkk": gas_dkk, "co2_dkk": co2_dkk,
-        }
+        if use_overrides:
+            payload = {
+                "zone": zone, "hour_of_day": hour_of_day, "day_of_week": day_of_week,
+                "lag_24h": lag_24h, "lag_48h": lag_48h, "lag_168h": lag_168h,
+                "roll_mean": roll_mean, "roll_std": roll_std,
+                "temp_c": temp_c, "wind_ms": wind_ms,
+                "cloud_pct": cloud_pct, "humidity_pct": humidity_pct,
+                "load_mwh": load_mwh, "renewable_mwh": renewable_mwh,
+                "gas_dkk": gas_dkk, "co2_dkk": co2_dkk,
+            }
+        else:
+            payload = {"zone": zone, "hour_of_day": hour_of_day, "day_of_week": 1}
+
         result = api_post("/predict", payload) if api_up else None
 
         if result is not None and "_error" not in result:
@@ -446,19 +492,24 @@ def page_predict(api_up):
                     f"API error {result['_error']}: {result.get('detail')} — "
                     "running ST-HeteroSAGE locally."
                 )
-            pred, err = _predict_local_st(
-                zone=zone, hour_of_day=hour_of_day, day_of_week=day_of_week,
-                lag_24h=lag_24h, lag_48h=lag_48h, lag_168h=lag_168h,
-                roll_mean=roll_mean, roll_std=roll_std,
-                temp_c=temp_c, wind_ms=wind_ms, cloud_pct=cloud_pct, humidity_pct=humidity_pct,
-                load_mwh=load_mwh, renewable_mwh=renewable_mwh,
-                gas_dkk=gas_dkk, co2_dkk=co2_dkk,
-            )
+            if use_overrides:
+                pred, err = _predict_local_st(
+                    zone=zone, hour_of_day=hour_of_day, day_of_week=day_of_week,
+                    lag_24h=lag_24h, lag_48h=lag_48h, lag_168h=lag_168h,
+                    roll_mean=roll_mean, roll_std=roll_std,
+                    temp_c=temp_c, wind_ms=wind_ms, cloud_pct=cloud_pct,
+                    humidity_pct=humidity_pct, load_mwh=load_mwh,
+                    renewable_mwh=renewable_mwh, gas_dkk=gas_dkk, co2_dkk=co2_dkk,
+                )
+            else:
+                pred, err = _predict_local_st_simple(zone, hour_of_day)
+
             if pred is None:
                 st.error(f"ST-HeteroSAGE inference failed: {err}")
             else:
+                mode = "what-if overrides" if use_overrides else "pipeline features"
                 st.metric(
-                    f"Predicted price — {zone}  (ST-HeteroSAGE local)",
+                    f"Predicted price — {zone}  (ST-HeteroSAGE local, {mode})",
                     f"{pred:.2f} DKK",
                 )
                 st.caption("MAE ≈ 151 DKK on DK1+DK2 test set.")
