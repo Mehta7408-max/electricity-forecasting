@@ -1,8 +1,8 @@
 """
-FastAPI serving for HeteroPriceForecaster.
+FastAPI serving for HeteroSTPriceForecaster (ST-HeteroSAGE).
 
 GET  /health             -> model status
-GET  /metrics            -> test metrics from hetero_metrics_clean.json
+GET  /metrics            -> test metrics from st_hetero_metrics.json
 POST /predict            -> day-ahead price forecast for DK1 or DK2
 POST /pipeline/run       -> trigger the full MLOps pipeline as a background task
 GET  /pipeline/status    -> return last pipeline run status
@@ -27,14 +27,22 @@ from pydantic import BaseModel, Field
 _SRC = Path(__file__).parent
 _ARTIFACTS_HETERO = _SRC / "artifacts_hetero"
 _GRAPH_DIR = _SRC / "data" / "graphs_hetero"
-_METRICS_FILE = _ARTIFACTS_HETERO / "hetero_metrics_clean.json"
+_METRICS_FILE = _ARTIFACTS_HETERO / "st_hetero_metrics.json"
 _SCALER_FILE = _GRAPH_DIR / "hetero_scalers.pkl"
-_CKPT_FILE = _ARTIFACTS_HETERO / "best_hetero_model.pt"
+_CKPT_FILE = _ARTIFACTS_HETERO / "best_st_hetero_model.pt"
+
+# Spatial-only edge types — lag_to is handled by the CausalTCN inside the model
+SPATIAL_EDGE_TYPES = [
+    ('hour',   'co_occurs_with', 'hour'),
+    ('hour',   'belongs_to',     'market'),
+    ('market', 'rev_belongs_to', 'hour'),
+    ('market', 'interconnects',  'market'),
+]
 
 app = FastAPI(
     title="Electricity Price Forecasting API",
-    description="HeteroPriceForecaster (HeteroSAGE) — DK1 & DK2 zones",
-    version="1.0.0",
+    description="ST-HeteroSAGE (CausalTCN + HeteroConv) — DK1 & DK2 zones",
+    version="2.0.0",
 )
 
 # Track pipeline state between background runs
@@ -44,40 +52,61 @@ _pipeline_status: dict = {"status": "idle"}
 # Startup: load model + scalers
 # ---------------------------------------------------------------------------
 _model = None
-_x_override = None
 _scalers = None
 _hetero_data = None
 _num_hours = None
 _device = None
+_edge_index_dict = None
+_target_scaler = None
 
 
 @app.on_event("startup")
 async def load_model():
-    global _model, _x_override, _scalers, _hetero_data, _num_hours, _device
+    global _model, _scalers, _hetero_data, _num_hours, _device, _edge_index_dict, _target_scaler
 
     try:
         import torch
+        from sklearn.preprocessing import StandardScaler
         from hetero_config import DEVICE, GRAPH_DIR, ARTIFACTS_DIR
-        from hetero_models import load_hetero_model
+        from hetero_st_model import HeteroSTPriceForecaster
 
         _device = DEVICE
 
-        # Load graph for metadata + num_hours
+        # Load graph
         data = torch.load(GRAPH_DIR / "hetero_graph.pt", map_location=DEVICE, weights_only=False)
         _num_hours = int(data["hour"].num_hours_per_zone)
         _hetero_data = data
 
-        # Load model
-        ckpt = ARTIFACTS_DIR / "best_hetero_model.pt"
-        _model, _x_override = load_hetero_model(data, ckpt, DEVICE)
-        _model.eval()
+        # Spatial-only edge dict (lag_to handled by CausalTCN)
+        _edge_index_dict = {et: data[et].edge_index.to(DEVICE) for et in SPATIAL_EDGE_TYPES}
 
         # Load scalers
-        scaler_path = GRAPH_DIR / "hetero_scalers.pkl"
-        with open(scaler_path, "rb") as f:
+        with open(GRAPH_DIR / "hetero_scalers.pkl", "rb") as f:
             _scalers = pickle.load(f)
 
-        print(f"[API] Model loaded — {_num_hours} hours/zone, device={DEVICE}")
+        # Refit target_scaler on DK1+DK2 training nodes (matches st_train.py)
+        T = _num_hours
+        tr_mask = data['hour'].train_mask.cpu().numpy()
+        dk12_mask = np.zeros(4 * T, dtype=bool)
+        dk12_mask[:2 * T] = True
+        y_raw = data['hour'].y.cpu().numpy()
+        _target_scaler = StandardScaler()
+        _target_scaler.fit(y_raw[tr_mask & dk12_mask].reshape(-1, 1))
+
+        # Build and load model
+        in_channels = data['hour'].x.shape[1]
+        _model = HeteroSTPriceForecaster(
+            in_channels=in_channels,
+            hidden_channels=128,
+            num_st_blocks=2,
+            temporal_dilations=(1, 4, 24),
+            temporal_kernel=7,
+        ).to(DEVICE)
+        _model.load_state_dict(torch.load(ARTIFACTS_DIR / "best_st_hetero_model.pt",
+                                           map_location=DEVICE, weights_only=False))
+        _model.eval()
+
+        print(f"[API] ST-HeteroSAGE loaded — {_num_hours} hours/zone, device={DEVICE}")
 
     except Exception as exc:
         print(f"[API] WARNING: model load failed — {exc}")
@@ -120,7 +149,7 @@ class PredictResponse(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": "HeteroSAGE", "zones": ["DK1", "DK2"]}
+    return {"status": "ok", "model": "ST-HeteroSAGE", "zones": ["DK1", "DK2"]}
 
 
 @app.get("/metrics")
@@ -133,7 +162,7 @@ def get_metrics():
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
-    if _model is None or _scalers is None or _hetero_data is None:
+    if _model is None or _scalers is None or _hetero_data is None or _target_scaler is None:
         raise HTTPException(status_code=503, detail="Model not loaded — check startup logs")
 
     zone = req.zone.upper()
@@ -152,53 +181,29 @@ def predict(req: PredictRequest):
         week_cos = math.cos(2 * math.pi * req.day_of_week / 7.0)
 
         raw_features = np.array([[
-            req.lag_24h,
-            req.lag_48h,
-            req.lag_168h,
-            req.rolling_24h_mean,
-            req.rolling_24h_std,
-            req.temperature_c,
-            req.wind_speed_ms,
-            req.cloud_cover_pct,
-            req.humidity_pct,
-            req.load_mwh,
-            req.renewable_mwh,
-            req.gas_dkk,
-            req.co2_dkk,
-            hour_sin,
-            hour_cos,
-            week_sin,
-            week_cos,
-        ]], dtype=np.float32)  # shape (1, 17)
+            req.lag_24h, req.lag_48h, req.lag_168h,
+            req.rolling_24h_mean, req.rolling_24h_std,
+            req.temperature_c, req.wind_speed_ms, req.cloud_cover_pct, req.humidity_pct,
+            req.load_mwh, req.renewable_mwh, req.gas_dkk, req.co2_dkk,
+            hour_sin, hour_cos, week_sin, week_cos,
+        ]], dtype=np.float32)
 
         feat_scaler = _scalers["feature_scaler"]
-        scaled_features = feat_scaler.transform(raw_features)  # (1, 13)
+        scaled_features = feat_scaler.transform(raw_features)
 
-        # Clone x_dict, replace last test node for the requested zone
-        # Zone layout: DK1 = [0 : num_hours], DK2 = [num_hours : 2*num_hours]
+        # Clone x_dict, override last node in the zone with the request features
+        # Zone layout (blocked): DK1 = [0, T), DK2 = [T, 2T)
         x_dict = {k: v.clone() for k, v in _hetero_data.x_dict.items()}
-
-        if _x_override is not None:
-            x_dict.update(_x_override)
-
         zone_offset = 0 if zone == "DK1" else _num_hours
-        # Replace the last node in the zone with the request features
         node_idx = zone_offset + _num_hours - 1
         x_dict["hour"][node_idx] = torch.tensor(scaled_features[0], dtype=torch.float32).to(_device)
-
-        ei = {k: v.to(_device) for k, v in _hetero_data.edge_index_dict.items()}
         x_dict = {k: v.to(_device) for k, v in x_dict.items()}
 
         with torch.no_grad():
-            out = _model(x_dict, ei, num_hours=_num_hours).view(-1)
+            out = _model(x_dict, _edge_index_dict)
 
         predicted_scaled = out[node_idx].item()
-
-        # Inverse-transform: the model outputs raw DKK (hetero model is trained on raw y)
-        # (If target_scaler was used, uncomment the line below)
-        # target_scaler = _scalers["target_scaler"]
-        # predicted_dkk = float(target_scaler.inverse_transform([[predicted_scaled]])[0][0])
-        predicted_dkk = float(predicted_scaled)
+        predicted_dkk = float(_target_scaler.inverse_transform([[predicted_scaled]])[0][0])
 
         return PredictResponse(zone=zone, predicted_price_dkk=predicted_dkk)
 

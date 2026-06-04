@@ -252,41 +252,106 @@ def page_overview():
 
 # ---------------------------------------------------------------------------
 # Page 2 — Live Prediction
-# ---------------------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def _load_xgb_model():
-    """Load the XGBoost baseline for local (API-free) inference."""
+# Spatial edge types used for local ST-HeteroSAGE inference (lag_to handled by CausalTCN)
+_ST_SPATIAL_EDGE_TYPES = [
+    ('hour',   'co_occurs_with', 'hour'),
+    ('hour',   'belongs_to',     'market'),
+    ('market', 'rev_belongs_to', 'hour'),
+    ('market', 'interconnects',  'market'),
+]
+
+_ST_GRAPH_PATH  = _SRC / "data" / "graphs_hetero" / "hetero_graph.pt"
+_ST_CKPT_PATH   = _HETERO / "best_st_hetero_model.pt"
+_ST_SCALER_PATH = _SRC / "data" / "graphs_hetero" / "hetero_scalers.pkl"
+
+
+@st.cache_resource(show_spinner="Loading ST-HeteroSAGE…")
+def _load_st_local():
+    """Load ST-HeteroSAGE for offline inference. Returns None if files missing."""
     try:
-        import pickle
-        with open(XGB_MODEL_PATH, "rb") as f:
-            return pickle.load(f)
-    except Exception as exc:
-        return {"_error": str(exc)}
+        import torch
+        import pickle as _pkl
+        from sklearn.preprocessing import StandardScaler
+        from hetero_st_model import HeteroSTPriceForecaster
+
+        if not all(p.exists() for p in [_ST_GRAPH_PATH, _ST_CKPT_PATH, _ST_SCALER_PATH]):
+            return None
+
+        device = torch.device("cpu")
+        data = torch.load(_ST_GRAPH_PATH, map_location=device, weights_only=False)
+        T = int(data['hour'].num_hours_per_zone)
+
+        edge_index_dict = {et: data[et].edge_index.to(device) for et in _ST_SPATIAL_EDGE_TYPES}
+
+        with open(_ST_SCALER_PATH, "rb") as f:
+            scalers = _pkl.load(f)
+
+        # Refit target_scaler on DK1+DK2 training nodes — matches st_train.py
+        tr_mask = data['hour'].train_mask.cpu().numpy()
+        dk12 = np.zeros(4 * T, dtype=bool)
+        dk12[:2 * T] = True
+        y_raw = data['hour'].y.cpu().numpy()
+        target_scaler = StandardScaler()
+        target_scaler.fit(y_raw[tr_mask & dk12].reshape(-1, 1))
+
+        in_channels = data['hour'].x.shape[1]
+        model = HeteroSTPriceForecaster(
+            in_channels=in_channels, hidden_channels=128, num_st_blocks=2,
+            temporal_dilations=(1, 4, 24), temporal_kernel=7,
+        )
+        model.load_state_dict(torch.load(_ST_CKPT_PATH, map_location=device, weights_only=False))
+        model.eval()
+
+        return model, data, scalers, target_scaler, edge_index_dict, T, device
+    except Exception:
+        return None
 
 
-def _predict_local_xgb(req):
-    """Run the XGBoost baseline locally. `req` is the same dict sent to the API.
-
-    Feature order matches xgboost_baseline.py:
-      hour_of_day, minute, zone_id, lag_24h, lag_48h, lag_168h,
-      roll_mean, roll_std, neighbor_de, neighbor_hydro, temp, wind, cloud
-    """
-    import numpy as np
-    model = _load_xgb_model()
-    if isinstance(model, dict) and "_error" in model:
-        return None, model["_error"]
-    zone_id = 0 if req["zone"].upper() == "DK1" else 1
-    # The form doesn't collect neighbour-zone prices; lag_24h is a leakage-free proxy.
-    neighbor = req["lag_24h"]
-    x = np.array([[
-        req["hour_of_day"], 0, zone_id,
-        req["lag_24h"], req["lag_48h"], req["lag_168h"],
-        req["rolling_24h_mean"], req["rolling_24h_std"],
-        neighbor, neighbor,
-        req["temperature_c"], req["wind_speed_ms"], req["cloud_cover_pct"],
-    ]], dtype=float)
+def _predict_local_st(req):
+    """Run ST-HeteroSAGE inference locally. Returns (price_dkk, error_str)."""
     try:
-        return float(model.predict(x)[0]), None
+        import torch
+
+        loaded = _load_st_local()
+        if loaded is None:
+            return None, "ST-HeteroSAGE model files not found"
+
+        model, data, scalers, target_scaler, edge_index_dict, T, device = loaded
+
+        zone = req.get("zone", "DK1").upper()
+        hour_of_day = req.get("hour_of_day", 12)
+        day_of_week = req.get("day_of_week", 0)
+
+        hour_sin = math.sin(2 * math.pi * hour_of_day / 24.0)
+        hour_cos = math.cos(2 * math.pi * hour_of_day / 24.0)
+        week_sin = math.sin(2 * math.pi * day_of_week / 7.0)
+        week_cos = math.cos(2 * math.pi * day_of_week / 7.0)
+
+        raw_features = np.array([[
+            req.get("lag_24h", 300.0), req.get("lag_48h", 300.0), req.get("lag_168h", 300.0),
+            req.get("rolling_24h_mean", 300.0), req.get("rolling_24h_std", 50.0),
+            req.get("temperature_c", 10.0), req.get("wind_speed_ms", 5.0),
+            req.get("cloud_cover_pct", 50.0), req.get("humidity_pct", 70.0),
+            req.get("load_mwh", 3500.0), req.get("renewable_mwh", 1500.0),
+            req.get("gas_dkk", 300.0), req.get("co2_dkk", 80.0),
+            hour_sin, hour_cos, week_sin, week_cos,
+        ]], dtype=np.float32)
+
+        scaled_features = scalers["feature_scaler"].transform(raw_features)
+
+        # Override the last node in the zone with the user's features
+        x_dict = {k: v.clone() for k, v in data.x_dict.items()}
+        zone_offset = 0 if zone == "DK1" else T
+        node_idx = zone_offset + T - 1
+        x_dict["hour"][node_idx] = torch.tensor(scaled_features[0], dtype=torch.float32)
+        x_dict = {k: v.to(device) for k, v in x_dict.items()}
+
+        with torch.no_grad():
+            out = model(x_dict, edge_index_dict)
+
+        predicted_dkk = float(target_scaler.inverse_transform([[out[node_idx].item()]])[0][0])
+        return predicted_dkk, None
+
     except Exception as exc:
         return None, str(exc)
 
@@ -294,18 +359,17 @@ def _predict_local_xgb(req):
 def page_predict(api_up):
     st.title("🔮 Live Prediction")
     st.markdown(
-        "Single-step price forecast. When the FastAPI server is up the request "
-        "is served by the **HeteroSAGE** model; otherwise the dashboard falls "
-        "back to a **local XGBoost** prediction so the page always works."
+        "Single-step day-ahead price forecast using **ST-HeteroSAGE** (MAE ≈ 151 DKK). "
+        "When the FastAPI server is running, the request is forwarded to the API; "
+        "otherwise the model runs locally inside the dashboard."
     )
 
     if api_up:
-        st.success("🟢 API connected — predictions served by HeteroSAGE.")
+        st.success("🟢 API connected — predictions served by ST-HeteroSAGE.")
     else:
         st.info(
-            "🔵 API offline — using the **local XGBoost baseline**. To serve the "
-            "HeteroSAGE model instead, start the API with `make serve` "
-            f"(or `docker compose up api`). Target: `API_BASE={API_BASE}`."
+            "🔵 API offline — running **ST-HeteroSAGE locally** inside the dashboard. "
+            f"To use the API instead, start it with `make serve` (target: `{API_BASE}`)."
         )
 
     with st.form("predict_form"):
@@ -355,27 +419,24 @@ def page_predict(api_up):
 
         if result is not None and "_error" not in result:
             st.metric(
-                f"Predicted price — {result.get('zone', zone)}  (HeteroSAGE)",
+                f"Predicted price — {result.get('zone', zone)}  (ST-HeteroSAGE via API)",
                 f"{result.get('predicted_price_dkk', float('nan')):.2f} DKK",
             )
         else:
             if result is not None and "_error" in result:
                 st.warning(
                     f"API error {result['_error']}: {result.get('detail')} — "
-                    "falling back to local XGBoost."
+                    "running ST-HeteroSAGE locally."
                 )
-            pred, err = _predict_local_xgb(payload)
+            pred, err = _predict_local_st(payload)
             if pred is None:
-                st.error(f"Local prediction failed: {err}")
+                st.error(f"Local ST-HeteroSAGE inference failed: {err}")
             else:
                 st.metric(
-                    f"Predicted price — {zone}  (local XGBoost)",
+                    f"Predicted price — {zone}  (ST-HeteroSAGE local)",
                     f"{pred:.2f} DKK",
                 )
-                st.caption(
-                    "Served locally by the XGBoost baseline (MAE ≈ 206 DKK). Start "
-                    "the API for the more accurate HeteroSAGE model (MAE ≈ 163 DKK)."
-                )
+                st.caption("MAE ≈ 151 DKK on the DK1+DK2 test set.")
 
 
 # ---------------------------------------------------------------------------
