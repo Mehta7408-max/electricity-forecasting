@@ -268,44 +268,42 @@ _ST_SCALER_PATH = _SRC / "data" / "graphs_hetero" / "hetero_scalers.pkl"
 
 @st.cache_resource(show_spinner="Loading ST-HeteroSAGE…")
 def _load_st_local():
-    """Load ST-HeteroSAGE for offline inference. Returns None if files missing."""
-    try:
-        import torch
-        import pickle as _pkl
-        from sklearn.preprocessing import StandardScaler
-        from hetero_st_model import HeteroSTPriceForecaster
+    """Load ST-HeteroSAGE for offline inference. Returns (tuple) or raises on error."""
+    import torch
+    import pickle as _pkl
+    from sklearn.preprocessing import StandardScaler
+    from hetero_st_model import HeteroSTPriceForecaster
 
-        if not all(p.exists() for p in [_ST_GRAPH_PATH, _ST_CKPT_PATH, _ST_SCALER_PATH]):
-            return None
+    missing = [str(p) for p in [_ST_GRAPH_PATH, _ST_CKPT_PATH, _ST_SCALER_PATH] if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing model files: {missing}")
 
-        device = torch.device("cpu")
-        data = torch.load(_ST_GRAPH_PATH, map_location=device, weights_only=False)
-        T = int(data['hour'].num_hours_per_zone)
+    device = torch.device("cpu")
+    data = torch.load(_ST_GRAPH_PATH, map_location=device, weights_only=False)
+    T = int(data['hour'].num_hours_per_zone)
 
-        edge_index_dict = {et: data[et].edge_index.to(device) for et in _ST_SPATIAL_EDGE_TYPES}
+    edge_index_dict = {et: data[et].edge_index.to(device) for et in _ST_SPATIAL_EDGE_TYPES}
 
-        with open(_ST_SCALER_PATH, "rb") as f:
-            scalers = _pkl.load(f)
+    with open(_ST_SCALER_PATH, "rb") as f:
+        scalers = _pkl.load(f)
 
-        # Refit target_scaler on DK1+DK2 training nodes — matches st_train.py
-        tr_mask = data['hour'].train_mask.cpu().numpy()
-        dk12 = np.zeros(4 * T, dtype=bool)
-        dk12[:2 * T] = True
-        y_raw = data['hour'].y.cpu().numpy()
-        target_scaler = StandardScaler()
-        target_scaler.fit(y_raw[tr_mask & dk12].reshape(-1, 1))
+    # Refit target_scaler on DK1+DK2 training nodes — matches st_train.py
+    tr_mask = data['hour'].train_mask.cpu().numpy()
+    dk12 = np.zeros(4 * T, dtype=bool)
+    dk12[:2 * T] = True
+    y_raw = data['hour'].y.cpu().numpy()
+    target_scaler = StandardScaler()
+    target_scaler.fit(y_raw[tr_mask & dk12].reshape(-1, 1))
 
-        in_channels = data['hour'].x.shape[1]
-        model = HeteroSTPriceForecaster(
-            in_channels=in_channels, hidden_channels=128, num_st_blocks=2,
-            temporal_dilations=(1, 4, 24), temporal_kernel=7,
-        )
-        model.load_state_dict(torch.load(_ST_CKPT_PATH, map_location=device, weights_only=False))
-        model.eval()
+    in_channels = data['hour'].x.shape[1]
+    model = HeteroSTPriceForecaster(
+        in_channels=in_channels, hidden_channels=128, num_st_blocks=2,
+        temporal_dilations=(1, 4, 24), temporal_kernel=7,
+    )
+    model.load_state_dict(torch.load(_ST_CKPT_PATH, map_location=device, weights_only=False))
+    model.eval()
 
-        return model, data, scalers, target_scaler, edge_index_dict, T, device
-    except Exception:
-        return None
+    return model, data, scalers, target_scaler, edge_index_dict, T, device
 
 
 def _predict_local_st(req):

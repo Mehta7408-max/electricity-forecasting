@@ -17,9 +17,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./src/data:/app/src/data
-      - ./src/artifacts:/app/src/artifacts
-      - ./src/artifacts_hetero:/app/src/artifacts_hetero
+      - ./src:/app/src
+      - ./artifacts:/app/artifacts
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app/src
@@ -34,9 +33,8 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      - ./src/data:/app/src/data
-      - ./src/artifacts:/app/src/artifacts
-      - ./src/artifacts_hetero:/app/src/artifacts_hetero
+      - ./src:/app/src
+      - ./artifacts:/app/artifacts
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app/src
