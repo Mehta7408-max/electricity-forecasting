@@ -313,6 +313,43 @@ def _load_st_local():
     return model, data, scalers, target_scaler, edge_index_dict, T, device
 
 
+@st.cache_data(show_spinner="Running ST-HeteroSAGE on full test set…")
+def _run_full_test_inference():
+    """
+    One forward pass over the entire graph; returns test-set actual vs predicted
+    for DK1 and DK2. Cached so it only runs once per session.
+    Returns {zone: DataFrame(timestamp, actual, predicted, error, hour_of_day, day_of_week)}.
+    """
+    import torch
+
+    model, data, scalers, target_scaler, edge_index_dict, T, device = _load_st_local()
+
+    x_dict = {'hour': data['hour'].x.to(device), 'market': data['market'].x.to(device)}
+    with torch.no_grad():
+        out = model(x_dict, edge_index_dict)
+
+    pred_dkk = target_scaler.inverse_transform(
+        out.cpu().numpy().reshape(-1, 1)).flatten()
+    actual_dkk = data['hour'].y.cpu().numpy()
+
+    start_ts = pd.Timestamp("2019-12-31 23:00:00")
+    results = {}
+    for zone, offset in [("DK1", 0), ("DK2", T)]:
+        mask = data['hour'].test_mask.numpy()[offset: offset + T]
+        tidx = np.where(mask)[0]
+        ts = pd.to_datetime([start_ts + pd.Timedelta(hours=int(t)) for t in tidx])
+        df = pd.DataFrame({
+            'timestamp':  ts,
+            'actual':     actual_dkk[offset + tidx].astype(float),
+            'predicted':  pred_dkk[offset + tidx].astype(float),
+        })
+        df['error']       = df['predicted'] - df['actual']
+        df['hour_of_day'] = df['timestamp'].dt.hour
+        df['day_of_week'] = df['timestamp'].dt.dayofweek
+        results[zone] = df
+    return results
+
+
 def _predict_local_st_simple(zone: str, hour_of_day: int):
     """
     Run ST-HeteroSAGE on the most-recent test node for (zone, hour_of_day)
@@ -520,9 +557,94 @@ def page_predict(api_up):
 # ---------------------------------------------------------------------------
 def page_forecast():
     st.title("📈 Forecast Analysis")
+
+    # ── 1. Test-set forecast timeline ──────────────────────────────────────
+    st.subheader("Test-set forecast timeline — ST-HeteroSAGE")
+    try:
+        results = _run_full_test_inference()
+        zone_t = st.selectbox("Zone", ["DK1", "DK2"], key="fc_zone_t")
+        df_t = results[zone_t]
+
+        window = st.slider("Window (days shown)", 7, 60, 14, key="fc_window")
+        t_end = df_t['timestamp'].max()
+        df_w = df_t[df_t['timestamp'] >= t_end - pd.Timedelta(days=window)]
+
+        fig_tl = go.Figure()
+        fig_tl.add_trace(go.Scatter(
+            x=df_w['timestamp'], y=df_w['actual'],
+            name="Actual", line=dict(color="#111827", width=1.5)))
+        fig_tl.add_trace(go.Scatter(
+            x=df_w['timestamp'], y=df_w['predicted'],
+            name="Predicted", line=dict(color=ST_COLOR, width=1.5, dash="dot")))
+        fig_tl.update_layout(
+            xaxis_title="Date", yaxis_title="Price (DKK/MWh)",
+            height=420, hovermode="x unified",
+            legend=dict(x=0, y=1, bgcolor="rgba(255,255,255,0.8)"),
+        )
+        st.plotly_chart(fig_tl, use_container_width=True)
+
+        mae   = float(np.abs(df_t['error']).mean())
+        ss_r  = float(np.sum(df_t['error'] ** 2))
+        ss_t  = float(np.sum((df_t['actual'] - df_t['actual'].mean()) ** 2))
+        r2    = 1.0 - ss_r / ss_t
+        c1, c2, c3 = st.columns(3)
+        c1.metric(f"{zone_t} test MAE",  f"{mae:.1f} DKK")
+        c2.metric(f"{zone_t} test R²",   f"{r2:.4f}")
+        c3.metric("Test set hours",      f"{len(df_t):,}")
+
+    except Exception as exc:
+        st.info(f"ST-HeteroSAGE artifacts not found — run `make train` first.  ({exc})")
+
+    st.divider()
+
+    # ── 2. Price heatmap — hour-of-day × day-of-week ──────────────────────
+    st.subheader("Price heatmap — hour of day × day of week")
+    try:
+        results_h = _run_full_test_inference()
+        zone_h = st.selectbox("Zone", ["DK1", "DK2"], key="fc_zone_h")
+        df_h   = results_h[zone_h]
+        dlbls  = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+        piv_act = df_h.pivot_table(index='hour_of_day', columns='day_of_week',
+                                    values='actual',    aggfunc='mean')
+        piv_pre = df_h.pivot_table(index='hour_of_day', columns='day_of_week',
+                                    values='predicted', aggfunc='mean')
+        piv_err = df_h.pivot_table(index='hour_of_day', columns='day_of_week',
+                                    values='error',     aggfunc='mean')
+
+        col_a, col_b, col_c = st.columns(3)
+        for col, piv, title, cscale, zmid in [
+            (col_a, piv_act, f"Actual — {zone_h}",    "YlOrRd", None),
+            (col_b, piv_pre, f"Predicted — {zone_h}", "YlOrRd", None),
+            (col_c, piv_err,  "Error (pred − actual)", "RdBu",   0.0),
+        ]:
+            with col:
+                fig_hm = go.Figure(go.Heatmap(
+                    z=piv.values,
+                    x=[dlbls[i] for i in piv.columns],
+                    y=[f"{h}:00" for h in piv.index],
+                    colorscale=cscale, zmid=zmid,
+                    colorbar=dict(title="DKK", thickness=12),
+                    hovertemplate="Day: %{x}<br>Hour: %{y}<br>%{z:.0f} DKK<extra></extra>",
+                ))
+                fig_hm.update_layout(title=title, height=440)
+                st.plotly_chart(fig_hm, use_container_width=True)
+
+        st.caption(
+            "Left/centre: mean actual vs predicted price by time-of-week slot. "
+            "Right: systematic bias — red = model over-predicts, blue = under-predicts. "
+            "Evening peak (17–21 h) and the weekend price softening are clearly captured."
+        )
+
+    except Exception as exc:
+        st.info(f"Heatmap unavailable.  ({exc})")
+
+    st.divider()
+
+    # ── 3. Existing day-ahead artifacts (HeteroSAGE profiles) ─────────────
     da = load_json_safe(DAY_AHEAD_PATH)
     if not da:
-        st.warning("Run day_ahead_forecast.py to generate day_ahead_results.json.")
+        st.info("Additional per-zone profiles available after running `make pipeline`.")
         return
 
     # ---- per-zone metrics -------------------------------------------------
@@ -1198,6 +1320,146 @@ def page_graph():
     )
     st.plotly_chart(fig2, use_container_width=True)
     st.caption(f"Nodes shown: {mid}  |  Edge relation types present in this slice: {len(drawn_rels)}")
+
+    # ---- 4. 3D spatio-temporal graph -------------------------------------
+    st.subheader("4. 3D spatio-temporal graph")
+    st.caption(
+        "Zones laid out **geographically** on the XY plane. "
+        "Time runs up the **Z axis**. "
+        "Node colour = actual price (yellow high, purple low). "
+        "Drag to rotate; scroll to zoom."
+    )
+
+    s_a, s_b = st.columns(2)
+    n3d   = s_a.slider("Hours per zone", 6, 48, 24, key="3d_n")
+    anch3 = s_b.slider("Start index", 0, max(0, T - n3d),
+                       min(int(T * 0.88), T - n3d), step=24, key="3d_a")
+    steps3 = list(range(anch3, anch3 + n3d))
+
+    # Geographic XY positions (roughly Nordic map)
+    zone_xy3 = {"DK1": (0.0, 1.0), "DK2": (1.5, 0.8), "HYDRO": (2.8, 2.2), "DE": (0.4, -0.6)}
+    zones3   = ["DK1", "DK2", "HYDRO", "DE"]
+
+    # Collect prices for shared colour scale
+    all_p = [float(g['hour'].y[zi * T + t])
+             for zi in range(4) for t in steps3]
+    p_lo, p_hi = min(all_p), max(all_p)
+
+    fig3 = go.Figure()
+
+    # Edge helpers ──────────────────────────────────────────────────────────
+    def _e3(xs, ys, zs, color, name, dash=None, width=2):
+        ldict = dict(color=color, width=width)
+        if dash:
+            ldict['dash'] = dash
+        fig3.add_trace(go.Scatter3d(
+            x=xs, y=ys, z=zs, mode='lines',
+            line=ldict, name=name, hoverinfo='none',
+            legendgroup=name, showlegend=(name not in {t.name for t in fig3.data}),
+        ))
+
+    # 1. lag_to — temporal chains along Z
+    for zi, z in enumerate(zones3):
+        x0, y0 = zone_xy3[z]
+        lx, ly, lz = [], [], []
+        for ci in range(len(steps3) - 1):
+            lx += [x0, x0, None]; ly += [y0, y0, None]; lz += [ci, ci + 1, None]
+        _e3(lx, ly, lz, "#3182bd", "lag_to (temporal)", width=2)
+
+    # 2. co_occurs_with — cross-zone spatial at each time step
+    co3 = [("DK1", "DK2"), ("DK2", "HYDRO")]
+    ex2, ey2, ez2 = [], [], []
+    for ci in range(len(steps3)):
+        for a, b in co3:
+            ax, ay = zone_xy3[a]; bx, by = zone_xy3[b]
+            ex2 += [ax, bx, None]; ey2 += [ay, by, None]; ez2 += [ci, ci, None]
+    _e3(ex2, ey2, ez2, "#31a354", "co_occurs_with (spatial)", width=1.5)
+
+    # 3. belongs_to — last time step down to market level (Z = -2)
+    mkt_z = -2.0
+    bx3, by3, bz3 = [], [], []
+    for z in zones3:
+        x0, y0 = zone_xy3[z]
+        bx3 += [x0, x0, None]; by3 += [y0, y0, None]; bz3 += [len(steps3) - 1, mkt_z, None]
+    _e3(bx3, by3, bz3, "#9e9ac8", "belongs_to", dash="dot", width=1.5)
+
+    # 4. interconnects — market ↔ market at Z = mkt_z
+    ict = [("DK1","DK2"), ("DK1","DE"), ("DK2","HYDRO"), ("DK1","HYDRO")]
+    ix3, iy3, iz3 = [], [], []
+    for a, b in ict:
+        ax, ay = zone_xy3[a]; bx, by = zone_xy3[b]
+        ix3 += [ax, bx, None]; iy3 += [ay, by, None]; iz3 += [mkt_z, mkt_z, None]
+    _e3(ix3, iy3, iz3, "#fd8d3c", "interconnects (market)", width=2.5)
+
+    # Hour nodes — coloured by price ────────────────────────────────────────
+    nx3, ny3, nz3, nc3, nh3, ns3 = [], [], [], [], [], []
+    start_ts3 = pd.Timestamp("2019-12-31 23:00:00")
+    for zi, z in enumerate(zones3):
+        x0, y0 = zone_xy3[z]
+        for ci, t in enumerate(steps3):
+            gi    = zi * T + t
+            price = float(g['hour'].y[gi])
+            ts_s  = (start_ts3 + pd.Timedelta(hours=t)).strftime("%Y-%m-%d %H:%M")
+            nx3.append(x0); ny3.append(y0); nz3.append(ci)
+            nc3.append(price)
+            nh3.append(f"<b>{z}</b>  {ts_s}<br>{price:,.0f} DKK/MWh")
+            ns3.append(10 if ci < len(steps3) - 1 else 16)
+
+    fig3.add_trace(go.Scatter3d(
+        x=nx3, y=ny3, z=nz3, mode='markers',
+        marker=dict(color=nc3, colorscale='Plasma', size=ns3,
+                    cmin=p_lo, cmax=p_hi,
+                    colorbar=dict(title="DKK/MWh", thickness=12, x=1.02),
+                    line=dict(color='white', width=0.5)),
+        hovertext=nh3, hoverinfo='text',
+        name='Hour nodes', showlegend=False,
+    ))
+
+    # Market nodes ──────────────────────────────────────────────────────────
+    mkt_colors3 = ["#9467bd", "#8c564b", "#e377c2", "#7f7f7f"]
+    fig3.add_trace(go.Scatter3d(
+        x=[zone_xy3[z][0] for z in zones3],
+        y=[zone_xy3[z][1] for z in zones3],
+        z=[mkt_z] * 4, mode='markers+text',
+        marker=dict(color=mkt_colors3, size=14, symbol='square',
+                    line=dict(color='white', width=1)),
+        text=zones3, textposition='top center',
+        hovertext=[f"{z} market node" for z in zones3],
+        hoverinfo='text', name='Market nodes', showlegend=False,
+    ))
+
+    # Zone labels floating above the topmost hour node ──────────────────────
+    for z in zones3:
+        x0, y0 = zone_xy3[z]
+        fig3.add_trace(go.Scatter3d(
+            x=[x0], y=[y0], z=[len(steps3) + 0.8],
+            mode='text', text=[f"<b>{z}</b>"],
+            textfont=dict(size=13, color=ZONE_COLORS[z]),
+            showlegend=False, hoverinfo='none',
+        ))
+
+    t0_str = (start_ts3 + pd.Timedelta(hours=anch3)).strftime("%Y-%m-%d %H:%M")
+    fig3.update_layout(
+        title=f"3D ST-HeteroSAGE graph — {n3d} h window from {t0_str}",
+        scene=dict(
+            xaxis=dict(showgrid=False, showticklabels=False, title=""),
+            yaxis=dict(showgrid=False, showticklabels=False, title=""),
+            zaxis=dict(title="Time step →", showgrid=True,
+                       gridcolor="#e5e7eb", zeroline=False),
+            bgcolor="white",
+            camera=dict(eye=dict(x=1.6, y=-1.6, z=1.1)),
+        ),
+        height=680,
+        legend=dict(x=0.01, y=0.98, bgcolor="rgba(255,255,255,0.85)",
+                    borderwidth=1, font=dict(size=10)),
+        margin=dict(l=0, r=0, t=40, b=0),
+    )
+    st.plotly_chart(fig3, use_container_width=True)
+    st.caption(
+        "Each column of nodes is one zone's temporal chain. "
+        "Larger nodes = most recent hour in the window. "
+        "Square nodes at the bottom = market nodes (zone identity embeddings)."
+    )
 
 
 # ---------------------------------------------------------------------------
