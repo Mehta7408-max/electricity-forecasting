@@ -50,13 +50,18 @@ def train_xgboost_baseline():
         # Stack features vertically
         df = pd.concat([df_dk1, df_dk2], ignore_index=True)
 
-        # 4. Execute a strict chronological split (80% Train, 20% Test)
+        # 4. Chronological 80/10/10 split — matches the GNN train/val/test windows
+        #    exactly so all models are evaluated on the same calendar period.
+        #    XGBoost has no early stopping so the middle 10% (val window) is unused;
+        #    we simply skip it and evaluate on the final 10% only.
         unique_timestamps = sorted(df['timestamp'].unique())
-        split_idx = int(0.8 * len(unique_timestamps))
-        split_timestamp = unique_timestamps[split_idx]
+        train_end_idx  = int(0.8 * len(unique_timestamps))
+        test_start_idx = int(0.9 * len(unique_timestamps))
+        train_ts = unique_timestamps[train_end_idx]
+        test_ts  = unique_timestamps[test_start_idx]
 
-        train_mask = df['timestamp'] < split_timestamp
-        test_mask = df['timestamp'] >= split_timestamp
+        train_mask = df['timestamp'] < train_ts
+        test_mask  = df['timestamp'] >= test_ts
 
         feature_cols = [
             'hour_of_day', 'minute', 'zone_id',
@@ -73,8 +78,9 @@ def train_xgboost_baseline():
         y_test = df.loc[test_mask, 'price_dkk']
 
         print(f"   Total Timeline Intervals: {len(unique_timestamps)}")
-        print(f"   Training Vectors: {len(X_train)} rows")
-        print(f"   Testing Vectors : {len(X_test)} rows")
+        print(f"   Training Vectors : {len(X_train)} rows  (< {train_ts})")
+        print(f"   Skipped (val)    : {test_start_idx - train_end_idx} hours  (unused — no early stopping)")
+        print(f"   Testing Vectors  : {len(X_test)} rows  (>= {test_ts})")
 
         # 5. Train Tabular Regressor Model
         n_estimators = 250
@@ -118,6 +124,13 @@ def train_xgboost_baseline():
         smape = np.mean(2.0 * np.abs(y_pred - y_test_np) / (np.abs(y_test_np) + np.abs(y_pred) + 1e-8)) * 100
 
         metrics = {
+            "model":        "XGBoost",
+            "train_split":  "80%",
+            "val_split":    "10% (unused — no early stopping)",
+            "test_split":   "10%",
+            "eval_zones":   "DK1 + DK2",
+            "test_start":   str(test_ts),
+            "n_features":   len(feature_cols),
             "mae":   float(mean_absolute_error(y_test, y_pred)),
             "rmse":  float(np.sqrt(mean_squared_error(y_test, y_pred))),
             "r2":    float(r2_score(y_test, y_pred)),
