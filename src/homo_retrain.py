@@ -26,6 +26,11 @@ def homo_retrain(hidden_channels=128, max_epochs=200, patience=25, rebuild_graph
     print("\n Homogeneous GNN Retrain (GraphSAGE, full 5.7-year dataset)")
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Deterministic init/training so the saved checkpoint and metrics are
+    # reproducible (matches quick_retrain.py's seeding for the hetero models).
+    torch.manual_seed(42)
+    np.random.seed(42)
+
     # ── MLflow setup ───────────────────────────────────────────────────────────
     try:
         setup_mlflow()
