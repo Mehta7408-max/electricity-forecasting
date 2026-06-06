@@ -71,12 +71,19 @@ class TemporalGraphBuilder:
                 raw_y[node_idx] = df['price_dkk'].fillna(0.0).values.astype(np.float32)
 
         # ── Scalers ───────────────────────────────────────────────────────────
-        X_scaled = self.scaler.fit_transform(raw_x)
-
+        # Both scalers are fit on training data only — consistent with the hetero
+        # graph builder and required for a leakage-free benchmark.
         train_hours = int(num_hours * train_mask_ratio)
         t_train = np.arange(train_hours)
-        # Fit target scaler strictly on DK1+DK2 training nodes (exclude zero-filled zones)
         dk12_train_idx = np.concatenate([t_train * 4 + 0, t_train * 4 + 1])
+
+        # Feature scaler: fit on all 4 zones in the training window so DE/HYDRO
+        # stay in a comparable scaled range (same rationale as hetero builder).
+        all_train_idx = np.concatenate([t_train * 4 + z for z in range(4)])
+        self.scaler.fit(raw_x[all_train_idx])
+        X_scaled = self.scaler.transform(raw_x)
+
+        # Target scaler: fit strictly on DK1+DK2 training nodes.
         self.target_scaler.fit(raw_y[dk12_train_idx].reshape(-1, 1))
         Y_scaled = self.target_scaler.transform(raw_y.reshape(-1, 1)).flatten()
 
