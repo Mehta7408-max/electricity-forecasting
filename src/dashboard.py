@@ -243,8 +243,9 @@ def page_overview():
     st.subheader("Verdict")
     st.markdown(
         "**ST-HeteroSAGE** (spatio-temporal heterogeneous GNN with CausalTCN) achieves the "
-        "best results across all metrics: **MAE 151 DKK, R² 0.696** — an **18% MAE reduction** "
-        "versus XGBoost (evaluated on the same 10% test window) and a 6.7% improvement over the homogeneous GraphSAGE baseline. "
+        "best results across all metrics: **MAE 151 DKK, R² 0.696** — a **16% MAE reduction** "
+        "versus a feature-parity XGBoost (same 18 inputs, same 10% test window: MAE 179 DKK) "
+        "and a 6.7% improvement over the homogeneous GraphSAGE baseline. "
         "The ablation study shows that CausalTCN accounts for the largest single gain, while "
         "the heterogeneous market bridge (market nodes + interconnect edges) provides a further "
         "meaningful improvement over a purely spatial or purely temporal approach."

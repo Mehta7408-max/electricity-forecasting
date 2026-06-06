@@ -14,7 +14,7 @@ from mlflow_config import setup_mlflow
 
 
 def train_xgboost_baseline():
-    print("\n Training Production-Aligned XGBoost Baseline (DK1 + DK2)...")
+    print("\n Training Feature-Parity XGBoost Baseline (DK1 + DK2)...")
 
     # ── MLflow setup ────────────────────────────────────────────────────────────
     try:
@@ -63,18 +63,28 @@ def train_xgboost_baseline():
         train_mask = df['timestamp'] < train_ts
         test_mask  = df['timestamp'] >= test_ts
 
+        # Feature-parity set: the 13 original columns PLUS the 5 fundamentals/market
+        # factors the GNNs receive (humidity, demand, renewable generation, gas, CO2).
+        # load_mwh / renewable_mwh arrive already per-zone z-scored from the pipeline
+        # — identical to what the GNN nodes carry. XGBoost is scale-invariant so the
+        # z-scoring is harmless; this guarantees both model families see the SAME
+        # information and the MAE gap reflects architecture, not feature access.
         feature_cols = [
             'hour_of_day', 'minute', 'zone_id',
             'price_lag_24h', 'price_lag_48h', 'price_lag_168h',
             'price_rolling_24h_mean', 'price_rolling_24h_std',
             'neighbor_price_de', 'neighbor_price_hydro',
-            'temperature_c', 'wind_speed_ms', 'cloud_cover_pct'
+            'temperature_c', 'wind_speed_ms', 'cloud_cover_pct',
+            # ── feature-parity additions (match GNN input set) ──
+            'humidity_pct', 'load_mwh', 'renewable_mwh', 'gas_dkk', 'co2_dkk',
         ]
 
-        X_train = df.loc[train_mask, feature_cols].fillna(0)
+        # Coerce every feature to numeric — some source columns (e.g. humidity_pct)
+        # arrive as object dtype and XGBoost rejects non-numeric frames.
+        X_train = df.loc[train_mask, feature_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
         y_train = df.loc[train_mask, 'price_dkk']
 
-        X_test = df.loc[test_mask, feature_cols].fillna(0)
+        X_test = df.loc[test_mask, feature_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
         y_test = df.loc[test_mask, 'price_dkk']
 
         print(f"   Total Timeline Intervals: {len(unique_timestamps)}")
