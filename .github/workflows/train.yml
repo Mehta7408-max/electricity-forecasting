@@ -6,15 +6,23 @@ on:
       model:
         description: "Which model to train"
         required: true
-        default: "all"
+        default: "st_hetero"
         type: choice
         options:
           - all
           - xgboost
           - homo
-          - hetero
+          - st_hetero
+      train_mode:
+        description: "Training mode — warm_start fine-tunes the frozen checkpoint (use when new data arrives); full_retrain trains from scratch (use after architecture or training code changes)"
+        required: true
+        default: "full_retrain"
+        type: choice
+        options:
+          - full_retrain
+          - warm_start
       max_epochs:
-        description: "Maximum training epochs (GNN models)"
+        description: "Maximum training epochs (ignored in warm_start — capped at 40 automatically)"
         required: false
         default: "200"
         type: string
@@ -27,13 +35,12 @@ on:
           - "false"
           - "true"
 
-  push:
-    branches:
-      - main
+# No push trigger — retraining is a deliberate manual decision only.
+# Routine pushes (docs, dashboard, API changes) must not touch frozen checkpoints.
 
 jobs:
   pipeline:
-    name: MLOps Pipeline — ${{ github.event_name == 'push' && 'auto (push to main)' || github.event.inputs.model || 'all' }}
+    name: MLOps Pipeline — ${{ github.event.inputs.model }} (${{ github.event.inputs.train_mode }})
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
@@ -52,31 +59,55 @@ jobs:
           pip install -r requirements.txt
 
       # ------------------------------------------------------------------
-      # Data ingestion (runs on every push to main + manual dispatch)
+      # Data ingestion — incremental fetch only
+      # Sets NEW_ROWS output so downstream steps can skip if nothing arrived
       # ------------------------------------------------------------------
       - name: Ingest data (incremental)
+        id: ingest
         env:
           PYTHONPATH: src
         run: |
           python - <<'EOF'
-          import sys, json
+          import sys, json, os
           sys.path.insert(0, 'src')
           from data_ingestion import run_ingestion
           report = run_ingestion(full_history=False)
           print(json.dumps(report, indent=2, default=str))
+          new_rows = report.get('new_rows', 0)
+          print(f"\nnew_rows={new_rows}")
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
+              fh.write(f"new_rows={new_rows}\n")
           EOF
 
       # ------------------------------------------------------------------
-      # Model training (skip on push if only docs changed; always on dispatch)
+      # Guard: skip training if no new data AND force_rebuild is false
+      # warm_start without new data is pointless; full_retrain is always allowed
+      # ------------------------------------------------------------------
+      - name: Check whether training should proceed
+        id: guard
+        run: |
+          NEW_ROWS=${{ steps.ingest.outputs.new_rows }}
+          TRAIN_MODE=${{ github.event.inputs.train_mode }}
+          FORCE=${{ github.event.inputs.force_rebuild }}
+
+          if [ "$TRAIN_MODE" = "warm_start" ] && [ "$NEW_ROWS" = "0" ] && [ "$FORCE" = "false" ]; then
+            echo "No new data and warm_start requested — skipping training. Frozen checkpoint is already up to date."
+            echo "should_train=false" >> $GITHUB_OUTPUT
+          else
+            echo "should_train=true" >> $GITHUB_OUTPUT
+          fi
+
+      # ------------------------------------------------------------------
+      # Model training — only runs if guard passes
       # ------------------------------------------------------------------
       - name: Train XGBoost
-        if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.model == 'xgboost' || github.event.inputs.model == 'all') }}
+        if: ${{ steps.guard.outputs.should_train == 'true' && (github.event.inputs.model == 'xgboost' || github.event.inputs.model == 'all') }}
         env:
           PYTHONPATH: src
         run: python src/xgboost_baseline.py
 
       - name: Train HomoGNN (GraphSAGE)
-        if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.model == 'homo' || github.event.inputs.model == 'all') }}
+        if: ${{ steps.guard.outputs.should_train == 'true' && (github.event.inputs.model == 'homo' || github.event.inputs.model == 'all') }}
         env:
           PYTHONPATH: src
         run: |
@@ -88,29 +119,34 @@ jobs:
           homo_retrain(max_epochs=max_epochs)
           EOF
 
-      - name: Train HeteroSAGE
-        if: ${{ github.event_name == 'push' || github.event.inputs.model == 'hetero' || github.event.inputs.model == 'all' }}
+      - name: Train ST-HeteroSAGE (winner)
+        if: ${{ steps.guard.outputs.should_train == 'true' && (github.event.inputs.model == 'st_hetero' || github.event.inputs.model == 'all') }}
         env:
           PYTHONPATH: src
         run: |
           python - <<'EOF'
-          import sys
+          import sys, os
           sys.path.insert(0, 'src')
-          from quick_retrain import quick_retrain
-          import os
-          # Use dispatch input when available; default to 200 for push-triggered runs
-          max_epochs = int(os.environ.get("MAX_EPOCHS", "200"))
-          quick_retrain(max_epochs=max_epochs)
+          from st_train import st_train
+
+          train_mode  = "${{ github.event.inputs.train_mode }}"
+          max_epochs  = int("${{ github.event.inputs.max_epochs || '200' }}")
+
+          if train_mode == "warm_start":
+              # Gentle fine-tune over the existing frozen checkpoint.
+              # Short budget and reduced LR — the model already knows price dynamics.
+              st_train(max_epochs=40, patience=10, lr=5e-4)
+          else:
+              # Full retrain from scratch — used after architecture or training code changes.
+              st_train(max_epochs=max_epochs, patience=25, lr=1e-3)
           EOF
-        env:
-          PYTHONPATH: src
-          MAX_EPOCHS: ${{ github.event.inputs.max_epochs || '200' }}
 
       # ------------------------------------------------------------------
-      # Validate metrics — regression guard
-      # Fail the workflow if new MAE > 1.5x previous best MAE
+      # Regression guard — checks ST-HeteroSAGE metrics only
+      # Fails if new MAE > 1.5x previous best (catches silent regressions)
       # ------------------------------------------------------------------
       - name: Validate metrics (regression guard)
+        if: ${{ steps.guard.outputs.should_train == 'true' }}
         env:
           PYTHONPATH: src
         run: |
@@ -119,18 +155,18 @@ jobs:
           from pathlib import Path
           sys.path.insert(0, 'src')
 
-          artifacts = Path('src/artifacts_hetero')
-          metrics_file = artifacts / 'hetero_metrics_clean.json'
-          prev_file = artifacts / 'previous_best_metrics.json'
+          artifacts  = Path('src/artifacts_hetero')
+          metrics_file = artifacts / 'st_hetero_metrics.json'
+          prev_file    = artifacts / 'previous_best_st_metrics.json'
 
           if not metrics_file.exists():
-              print("No new metrics file found — skipping regression guard")
+              print("No ST-HeteroSAGE metrics file found — skipping regression guard")
               sys.exit(0)
 
           with open(metrics_file) as f:
               new_metrics = json.load(f)
           new_mae = new_metrics.get('mae', float('inf'))
-          print(f"New MAE: {new_mae:.4f} DKK")
+          print(f"New MAE:  {new_mae:.4f} DKK")
 
           if prev_file.exists():
               with open(prev_file) as f:
@@ -143,7 +179,6 @@ jobs:
                   sys.exit(1)
               else:
                   print(f"Regression guard passed: {new_mae:.4f} <= {threshold:.4f}")
-                  # Update previous best if improved
                   if new_mae < prev_mae:
                       import shutil
                       shutil.copy(metrics_file, prev_file)
@@ -155,7 +190,7 @@ jobs:
           EOF
 
       - name: Compare models
-        if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.model == 'all' || github.event.inputs.model == 'hetero') }}
+        if: ${{ steps.guard.outputs.should_train == 'true' && (github.event.inputs.model == 'all' || github.event.inputs.model == 'st_hetero') }}
         env:
           PYTHONPATH: src
         run: python src/compare_models.py
@@ -164,6 +199,7 @@ jobs:
       # Upload artifacts
       # ------------------------------------------------------------------
       - name: Upload model artifacts
+        if: ${{ steps.guard.outputs.should_train == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: model-artifacts-${{ github.run_id }}
@@ -174,6 +210,7 @@ jobs:
           retention-days: 30
 
       - name: Upload MLflow database
+        if: ${{ steps.guard.outputs.should_train == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: mlruns-db-${{ github.run_id }}
