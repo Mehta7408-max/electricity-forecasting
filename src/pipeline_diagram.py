@@ -8,308 +8,278 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+from matplotlib.patches import FancyBboxPatch
 from pathlib import Path
 
-# ── Output path ───────────────────────────────────────────────────────────────
 OUT_DIR = Path(__file__).parent / "artifacts"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 OUT_PATH = OUT_DIR / "pipeline_diagram.png"
 
-# ── Colour palette ────────────────────────────────────────────────────────────
-C_DATA    = "#4A90D9"   # blue     — data sources
-C_PIPE    = "#7B68EE"   # indigo   — data pipeline
-C_HOMO    = "#E8A838"   # amber    — homogeneous track
-C_HETERO  = "#3DAA6B"   # green    — heterogeneous track
-C_XGBOOST = "#D45F5F"   # red      — xgboost baseline
-C_EVAL    = "#5B5EA6"   # navy     — evaluation
-C_WINNER  = "#2ECC71"   # bright   — winner highlight
-C_BG      = "#F7F9FC"   # near-white background
+# ── Colours ───────────────────────────────────────────────────────────────────
+C_DATA    = "#2E86C1"
+C_PIPE    = "#7D3C98"
+C_HOMO    = "#D68910"
+C_HETERO  = "#1E8449"
+C_XGB     = "#C0392B"
+C_EVAL    = "#1A5276"
+C_WIN     = "#27AE60"
+C_BG      = "#F4F6F7"
 C_ARROW   = "#555555"
-C_TEXT    = "#1A1A2E"
-C_PHASE   = "#EEEEEE"   # phase band fill
-
-FIG_W, FIG_H = 18, 24
+C_TEXT    = "#1C2833"
 
 
-def box(ax, x, y, w, h, label, sublabel=None,
-        fc="#FFFFFF", ec="#AAAAAA", lw=1.5,
-        fontsize=10, subfontsize=8.5, bold=False,
-        radius=0.02, text_color=C_TEXT):
-    """Draw a rounded rectangle with optional sublabel."""
-    fancy = FancyBboxPatch(
-        (x - w / 2, y - h / 2), w, h,
-        boxstyle=f"round,pad=0,rounding_size={radius}",
+def rbox(ax, cx, cy, w, h, lines, fc, ec, lw=1.6, sizes=None, bold_first=True):
+    """
+    Draw a rounded rect centred at (cx,cy) with stacked text lines.
+    lines  : list of strings
+    sizes  : list of font sizes matching lines (defaults to 9 for all)
+    """
+    patch = FancyBboxPatch(
+        (cx - w / 2, cy - h / 2), w, h,
+        boxstyle="round,pad=0,rounding_size=0.015",
         facecolor=fc, edgecolor=ec, linewidth=lw, zorder=3,
     )
-    ax.add_patch(fancy)
-    weight = "bold" if bold else "normal"
-    dy = 0.012 if sublabel else 0
-    ax.text(x, y + dy, label, ha="center", va="center",
-            fontsize=fontsize, fontweight=weight,
-            color=text_color, zorder=4, wrap=True,
-            multialignment="center")
-    if sublabel:
-        ax.text(x, y - 0.025, sublabel, ha="center", va="center",
-                fontsize=subfontsize, color="#555555", zorder=4,
-                style="italic", multialignment="center")
+    ax.add_patch(patch)
+
+    if sizes is None:
+        sizes = [9] * len(lines)
+
+    n = len(lines)
+    # distribute lines evenly inside the box
+    if n == 1:
+        offsets = [0]
+    else:
+        step = h * 0.55 / (n - 1)
+        offsets = [step * (i - (n - 1) / 2) for i in range(n)]
+
+    for i, (txt, sz, dy) in enumerate(zip(lines, sizes, offsets)):
+        weight = "bold" if (bold_first and i == 0) else "normal"
+        color  = C_TEXT if i == 0 else "#444444"
+        ax.text(cx, cy + dy, txt, ha="center", va="center",
+                fontsize=sz, fontweight=weight, color=color, zorder=4)
 
 
-def arrow(ax, x0, y0, x1, y1, color=C_ARROW, lw=1.5, style="->"):
-    ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
-                arrowprops=dict(arrowstyle=style, color=color,
-                                lw=lw, connectionstyle="arc3,rad=0.0"),
-                zorder=2)
+def arr(ax, x0, y0, x1, y1, color=C_ARROW, lw=1.4, rad=0.0):
+    ax.annotate(
+        "", xy=(x1, y1), xytext=(x0, y0),
+        arrowprops=dict(arrowstyle="-|>", color=color, lw=lw,
+                        mutation_scale=12,
+                        connectionstyle=f"arc3,rad={rad}"),
+        zorder=2,
+    )
 
 
-def arrow_curve(ax, x0, y0, x1, y1, color=C_ARROW, lw=1.5, rad=0.2):
-    ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
-                arrowprops=dict(arrowstyle="->", color=color,
-                                lw=lw, connectionstyle=f"arc3,rad={rad}"),
-                zorder=2)
+def band(ax, ytop, ybot, label, color):
+    ax.axhspan(ybot, ytop, xmin=0.0, xmax=1.0,
+               facecolor=color, alpha=0.06, zorder=0)
+    ax.text(-0.01, (ytop + ybot) / 2, label,
+            ha="right", va="center", fontsize=8.5,
+            color=color, fontweight="bold", rotation=90,
+            transform=ax.transData, zorder=1, clip_on=False)
 
 
-def phase_band(ax, y_top, y_bot, label, color):
-    """Horizontal shaded band for a pipeline phase."""
-    ax.axhspan(y_bot, y_top, xmin=0.01, xmax=0.99,
-               facecolor=color, alpha=0.07, zorder=0)
-    ax.text(0.013, (y_top + y_bot) / 2, label,
-            ha="left", va="center", fontsize=9, color=color,
-            fontweight="bold", rotation=90, zorder=1,
-            transform=ax.get_yaxis_transform())
-
-
-# ── Figure setup ──────────────────────────────────────────────────────────────
-fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
-ax.set_xlim(0, 1)
+# ── Canvas ────────────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(16, 22))
+ax.set_xlim(-0.05, 1.05)
 ax.set_ylim(0, 1)
 ax.axis("off")
 fig.patch.set_facecolor(C_BG)
 ax.set_facecolor(C_BG)
 
-fig.suptitle(
-    "ST-HeteroSAGE — End-to-End Forecasting Pipeline",
-    fontsize=15, fontweight="bold", color=C_TEXT, y=0.985,
-)
+fig.suptitle("ST-HeteroSAGE  —  End-to-End Forecasting Pipeline",
+             fontsize=14, fontweight="bold", color=C_TEXT, y=0.992)
 
 # ── Phase bands ───────────────────────────────────────────────────────────────
-phase_band(ax, 0.985, 0.870, "① Data Sources",    C_DATA)
-phase_band(ax, 0.865, 0.700, "② Data Pipeline",   C_PIPE)
-phase_band(ax, 0.695, 0.520, "③ Graph Construction", C_HOMO)
-phase_band(ax, 0.515, 0.280, "④ Model Training",  C_HETERO)
-phase_band(ax, 0.275, 0.010, "⑤ Evaluation",      C_EVAL)
-
-BW, BH = 0.20, 0.050   # standard box width / height
-SW, SH = 0.16, 0.044   # small box
-TW, TH = 0.26, 0.054   # tall/wide box
+band(ax, 0.990, 0.875, "1  Data Sources",      C_DATA)
+band(ax, 0.870, 0.715, "2  Data Pipeline",     C_PIPE)
+band(ax, 0.710, 0.530, "3  Graph Construction",C_HOMO)
+band(ax, 0.525, 0.295, "4  Model Training",    C_HETERO)
+band(ax, 0.290, 0.005, "5  Evaluation",        C_EVAL)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PHASE 1 — DATA SOURCES
+# PHASE 1  —  Data Sources
 # ─────────────────────────────────────────────────────────────────────────────
-y1 = 0.930
-src_xs = [0.22, 0.50, 0.78]
-src_labels = [
-    ("Energinet / Nord Pool", "Day-ahead spot prices\n(DK1, DK2, DE, HYDRO)"),
-    ("Energy-Charts\n(Fraunhofer ISE)", "Load, renewables,\ngas & CO₂ prices"),
-    ("Open-Meteo API", "Temperature, wind,\ncloud, humidity"),
+y1 = 0.925
+w1, h1 = 0.24, 0.070
+src = [
+    (0.18, ["Energinet / Nord Pool",  "Day-ahead spot prices", "(DK1, DK2, DE, HYDRO)"]),
+    (0.50, ["Energy-Charts (Fraunhofer ISE)", "Load, renewables,", "gas & CO2 prices"]),
+    (0.82, ["Open-Meteo API",         "Temperature, wind,", "cloud cover, humidity"]),
 ]
-for x, (lbl, sub) in zip(src_xs, src_labels):
-    box(ax, x, y1, BW, BH + 0.01, lbl, sublabel=sub,
-        fc="#EAF3FB", ec=C_DATA, lw=1.8, fontsize=9.5, bold=True)
+for cx, lines in src:
+    rbox(ax, cx, y1, w1, h1, lines,
+         fc="#EAF4FB", ec=C_DATA, sizes=[9.5, 8, 8])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PHASE 2 — DATA PIPELINE
+# PHASE 2  —  Data Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 y2a = 0.820
-box(ax, 0.50, y2a, 0.55, BH,
-    "Incremental Ingestion  →  SQLite Database",
-    fc="#F0EDF9", ec=C_PIPE, lw=1.8, fontsize=10, bold=True)
+rbox(ax, 0.50, y2a, 0.60, 0.055,
+     ["Incremental Ingestion", "SQLite database  |  incremental fetch  |  MLflow tracking"],
+     fc="#F5EEF8", ec=C_PIPE, sizes=[10, 8])
 
-y2b = 0.760
-pipe_steps = [
-    (0.22, "Feature Engineering",
-     "Lags (24 h, 48 h, 168 h)\nRolling stats · Cyclical encoding"),
-    (0.50, "Chronological Split",
-     "Train 80% · Val 10% · Test 10%\n(Mar 2025 – Sep 2025 test window)"),
-    (0.78, "Scaler Fit",
-     "StandardScaler fitted on\ntraining partition only"),
+y2b = 0.745
+pipe = [
+    (0.18, ["Feature Engineering",  "Lags 24h / 48h / 168h", "Rolling stats  |  Cyclical encoding"]),
+    (0.50, ["Chronological Split",  "Train 80%  |  Val 10%  |  Test 10%",
+            "Test window: Mar - Sep 2025"]),
+    (0.82, ["Scaler",               "StandardScaler", "fit on train partition only"]),
 ]
-for x, lbl, sub in pipe_steps:
-    box(ax, x, y2b, BW + 0.02, BH + 0.01, lbl, sublabel=sub,
-        fc="#F0EDF9", ec=C_PIPE, lw=1.5, fontsize=9.5, bold=True)
+w2, h2 = 0.27, 0.070
+for cx, lines in pipe:
+    rbox(ax, cx, y2b, w2, h2, lines,
+         fc="#F5EEF8", ec=C_PIPE, sizes=[9.5, 8, 8])
 
-# arrows: sources → ingestion
-for x in src_xs:
-    arrow(ax, x, y1 - (BH + 0.01) / 2,
-          x, y2a + BH / 2 + 0.005, color=C_DATA)
-
-# fan-in arrows to ingestion box edges, then fan-out to pipe steps
-arrow(ax, 0.50, y2a - BH / 2, 0.22, y2b + (BH + 0.01) / 2, color=C_PIPE)
-arrow(ax, 0.50, y2a - BH / 2, 0.50, y2b + (BH + 0.01) / 2, color=C_PIPE)
-arrow(ax, 0.50, y2a - BH / 2, 0.78, y2b + (BH + 0.01) / 2, color=C_PIPE)
+# arrows
+for cx, _ in src:
+    arr(ax, cx, y1 - h1 / 2, cx, y2a + 0.028, color=C_DATA)
+for cx, _ in pipe:
+    arr(ax, 0.50, y2a - 0.028, cx, y2b + h2 / 2, color=C_PIPE)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PHASE 3 — GRAPH CONSTRUCTION  (two parallel branches)
+# PHASE 3  —  Graph Construction
 # ─────────────────────────────────────────────────────────────────────────────
-y3a = 0.665
-box(ax, 0.28, y3a, 0.36, BH + 0.01,
-    "Homogeneous Graph",
-    sublabel="4 zones × T timesteps  |  17 features/node\n"
-             "Spatial edges: DK1–DK2, DK1–DE, DK2–DE, DK2–HYDRO\n"
-             "Temporal edges: 24 h & 168 h (bidirectional)",
-    fc="#FFF8E7", ec=C_HOMO, lw=1.8, fontsize=9.5, bold=True,
-    subfontsize=7.8)
+y3 = 0.635
+wh, hh = 0.38, 0.090
 
-box(ax, 0.72, y3a, 0.40, BH + 0.01,
-    "Heterogeneous Graph",
-    sublabel="Hour nodes (201,596 × 17 feat)  +  Market nodes (4 × one-hot)\n"
-             "5 edge types: co_occurs_with · belongs_to · rev_belongs_to\n"
-             "interconnects · lag_to (24 h, 48 h, 168 h)",
-    fc="#E8F6EE", ec=C_HETERO, lw=1.8, fontsize=9.5, bold=True,
-    subfontsize=7.8)
+rbox(ax, 0.27, y3, wh, hh,
+     ["Homogeneous Graph",
+      "4 zones x T timesteps  |  17 features per node",
+      "Spatial: DK1-DK2, DK1-DE, DK2-DE, DK2-HYDRO",
+      "Temporal: 24h and 168h bidirectional lags"],
+     fc="#FEF9E7", ec=C_HOMO, sizes=[10, 8, 8, 8])
 
-# pipe steps → graph boxes
-for src_x, dest_x in [(0.22, 0.28), (0.50, 0.50), (0.78, 0.72)]:
-    arrow(ax, src_x, y2b - (BH + 0.01) / 2,
-          dest_x, y3a + (BH + 0.01) / 2 + 0.005,
-          color=C_PIPE, lw=1.2)
+rbox(ax, 0.73, y3, wh + 0.04, hh,
+     ["Heterogeneous Graph",
+      "Hour nodes: 201,596 x 17 feat  |  Market nodes: 4 x one-hot",
+      "5 edge types: co_occurs_with, belongs_to,",
+      "rev_belongs_to, interconnects, lag_to"],
+     fc="#EAFAF1", ec=C_HETERO, sizes=[10, 8, 8, 8])
 
-# XGBoost branch — comes off the pipeline directly (no graph needed)
-y_xgb = 0.600
-box(ax, 0.50, y_xgb, SW + 0.02, SH,
-    "XGBoost Baseline",
-    sublabel="18 features · no graph structure",
-    fc="#FDEAEA", ec=C_XGBOOST, lw=1.8, fontsize=9.5, bold=True,
-    subfontsize=8)
-arrow(ax, 0.50, y2b - (BH + 0.01) / 2,
-      0.50, y_xgb + SH / 2, color=C_XGBOOST, lw=1.5)
+# XGBoost — no graph needed
+y_xgb = 0.570
+rbox(ax, 0.50, y_xgb, 0.26, 0.052,
+     ["XGBoost Baseline", "18 tabular features  |  no graph structure"],
+     fc="#FDEDEC", ec=C_XGB, sizes=[9.5, 8])
+
+# arrows phase 2 -> graphs
+arr(ax, 0.18, y2b - h2 / 2, 0.27, y3 + hh / 2, color=C_PIPE)
+arr(ax, 0.50, y2b - h2 / 2, 0.50, y3 + hh / 2, color=C_PIPE)
+arr(ax, 0.82, y2b - h2 / 2, 0.73, y3 + hh / 2, color=C_PIPE)
+arr(ax, 0.50, y2b - h2 / 2, 0.50, y_xgb + 0.026, color=C_XGB, lw=1.2)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PHASE 4 — MODEL TRAINING
+# PHASE 4  —  Model Training
 # ─────────────────────────────────────────────────────────────────────────────
-# Homogeneous track
-y4a = 0.490
-box(ax, 0.18, y4a, 0.26, BH,
-    "HomoGNN (GraphSAGE)",
-    sublabel="128 hidden · 3 layers\nMAE 173.19 DKK",
-    fc="#FFF8E7", ec=C_HOMO, lw=1.8, fontsize=9.5, bold=True,
-    subfontsize=8)
+y4 = 0.450
+wm, hm = 0.195, 0.068
 
-# Heterogeneous track — three models
-hetero_models = [
-    (0.50, "HeteroSAGE", "MAE 162.78 DKK"),
-    (0.68, "GAT", "MAE 179.20 DKK"),
-    (0.86, "ST-HeteroSAGE", "MAE 151.08 DKK  ★"),
+models = [
+    (0.13, C_HOMO,   ["HomoGNN", "(GraphSAGE)", "MAE  173.19 DKK"]),
+    (0.40, C_HETERO, ["HeteroSAGE",  "",        "MAE  162.78 DKK"]),
+    (0.62, C_HETERO, ["GAT",         "(indicative)", "MAE  179.20 DKK"]),
+    (0.84, C_WIN,    ["ST-HeteroSAGE", "(winner)", "MAE  151.08 DKK"]),
 ]
-for x, lbl, sub in hetero_models:
-    is_winner = "★" in sub
-    box(ax, x, y4a, 0.155, BH,
-        lbl, sublabel=sub,
-        fc="#D5F5E3" if is_winner else "#E8F6EE",
-        ec=C_WINNER if is_winner else C_HETERO,
-        lw=2.5 if is_winner else 1.8,
-        fontsize=9.5, bold=True, subfontsize=8)
+for cx, ec, lines in models:
+    is_win = ec == C_WIN
+    rbox(ax, cx, y4, wm, hm, lines,
+         fc="#D5F5E3" if is_win else "#F9F9F9",
+         ec=ec, lw=2.4 if is_win else 1.6,
+         sizes=[10, 8.5, 8.5])
 
-arrow(ax, 0.28, y3a - (BH + 0.01) / 2,
-      0.18, y4a + BH / 2, color=C_HOMO)
+# XGBoost model box
+rbox(ax, 0.50, y4, wm, hm,
+     ["XGBoost", "", "MAE  179.49 DKK"],
+     fc="#FDEDEC", ec=C_XGB, lw=1.6, sizes=[10, 8.5, 8.5])
 
-for x in [0.50, 0.68, 0.86]:
-    arrow(ax, 0.72, y3a - (BH + 0.01) / 2,
-          x, y4a + BH / 2, color=C_HETERO)
+# graph -> model arrows
+arr(ax, 0.27, y3 - hh / 2, 0.13, y4 + hm / 2, color=C_HOMO)
+arr(ax, 0.73, y3 - hh / 2, 0.40, y4 + hm / 2, color=C_HETERO)
+arr(ax, 0.73, y3 - hh / 2, 0.62, y4 + hm / 2, color=C_HETERO)
+arr(ax, 0.73, y3 - hh / 2, 0.84, y4 + hm / 2, color=C_HETERO)
+arr(ax, 0.50, y_xgb - 0.026, 0.50, y4 + hm / 2, color=C_XGB, lw=1.2)
 
-# XGBoost flows down
-arrow(ax, 0.50, y_xgb - SH / 2,
-      0.50, y4a + BH / 2, color=C_XGBOOST, lw=1.5)
-
-# ── Frozen checkpoint labels ──────────────────────────────────────────────────
-y_ckpt = 0.415
-ckpt_items = [
-    (0.18,  "best_homo_model.pt",       C_HOMO),
-    (0.50,  "best_hetero_model.pt",     C_HETERO),
-    (0.68,  "best_gat_model.pt",        C_HETERO),
-    (0.86,  "best_st_hetero_model.pt",  C_WINNER),
+# checkpoints
+y_ck = 0.375
+ck_items = [
+    (0.13, "best_homo_model.pt",      C_HOMO),
+    (0.40, "best_hetero_model.pt",    C_HETERO),
+    (0.50, "xgboost_model.json",      C_XGB),
+    (0.62, "best_gat_model.pt",       C_HETERO),
+    (0.84, "best_st_hetero_model.pt", C_WIN),
 ]
-for x, lbl, ec in ckpt_items:
-    box(ax, x, y_ckpt, 0.155, 0.030, f"[ckpt] {lbl}",
-        fc="#F9F9F9", ec=ec, lw=1.2, fontsize=7.5)
-    arrow(ax, x, y4a - BH / 2, x, y_ckpt + 0.015, color=ec, lw=1.0)
+for cx, lbl, ec in ck_items:
+    rbox(ax, cx, y_ck, 0.175, 0.032, [lbl],
+         fc="#FDFEFE", ec=ec, lw=1.1, sizes=[7.5], bold_first=False)
+    arr(ax, cx, y4 - hm / 2, cx, y_ck + 0.016, color=ec, lw=1.0)
 
-# MLflow tracking note
-ax.text(0.50, 0.373,
-        "All runs tracked in MLflow  ·  Deterministic seeds (torch 42 / numpy 42)  ·  Docker containerised",
-        ha="center", va="center", fontsize=8, color="#777777", style="italic")
+ax.text(0.50, 0.330,
+        "Deterministic seeds (torch 42 / numpy 42)   |   "
+        "MLflow experiment tracking   |   Docker containerised",
+        ha="center", va="center", fontsize=7.8,
+        color="#777777", style="italic")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PHASE 5 — EVALUATION
+# PHASE 5  —  Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
-y5a = 0.325
-box(ax, 0.50, y5a, 0.72, BH,
-    "Unified Test Evaluation  (DK1 + DK2 · test window Mar – Sep 2025)",
-    fc="#ECEAF7", ec=C_EVAL, lw=2.0, fontsize=10, bold=True)
+y5a = 0.285
+rbox(ax, 0.50, y5a, 0.75, 0.052,
+     ["Unified Test Evaluation",
+      "DK1 + DK2  |  Test window: March - September 2025  |  MAE, RMSE, R2, sMAPE"],
+     fc="#EAF0FB", ec=C_EVAL, lw=2.0, sizes=[10.5, 8.5])
 
-# all checkpoints → unified evaluation
-for x in [0.18, 0.50, 0.68, 0.86]:
-    arrow(ax, x, y_ckpt - 0.015,
-          x, y5a + BH / 2, color=C_EVAL, lw=1.2)
+for cx, _, ec in ck_items:
+    arr(ax, cx, y_ck - 0.016, cx, y5a + 0.026, color=C_EVAL, lw=1.0)
 
 # Evaluation outputs
-y5b = 0.240
-eval_outputs = [
-    (0.14, "Leaderboard\nMAE · RMSE · R² · sMAPE"),
-    (0.34, "Robustness Analysis\n3 perturbation families · 4 levels"),
-    (0.54, "Ablation Study\nComponent contribution"),
-    (0.74, "Feature Importance\nPermutation-based"),
-    (0.91, "Horizon Error\nHour-of-day · day-of-week"),
+y5b = 0.205
+ev = [
+    (0.10, ["Leaderboard",       "MAE / RMSE / R2 / sMAPE"]),
+    (0.29, ["Robustness",        "3 families x 4 intensity levels"]),
+    (0.50, ["Ablation Study",    "Component contribution"]),
+    (0.71, ["Feature Importance","Permutation-based"]),
+    (0.90, ["Horizon Error",     "Hour-of-day  |  day-of-week"]),
 ]
-for x, lbl in eval_outputs:
-    box(ax, x, y5b, 0.155, BH + 0.005, lbl,
-        fc="#ECEAF7", ec=C_EVAL, lw=1.3, fontsize=8.5)
-    arrow(ax, 0.50, y5a - BH / 2, x, y5b + (BH + 0.005) / 2,
-          color=C_EVAL, lw=1.0)
+we, he = 0.165, 0.058
+for cx, lines in ev:
+    rbox(ax, cx, y5b, we, he, lines,
+         fc="#EAF0FB", ec=C_EVAL, lw=1.2, sizes=[9, 8])
+    arr(ax, 0.50, y5a - 0.026, cx, y5b + he / 2, color=C_EVAL, lw=1.0)
 
 # Winner banner
-y5c = 0.145
-box(ax, 0.50, y5c, 0.70, BH + 0.01,
-    "Winner: ST-HeteroSAGE",
-    sublabel="MAE 151.08 DKK  ·  RMSE 204.36 DKK  ·  R² 0.696  ·  sMAPE 51.64%",
-    fc="#D5F5E3", ec=C_WINNER, lw=2.5, fontsize=11, bold=True,
-    subfontsize=9, text_color="#1A6B3C")
+y5c = 0.118
+rbox(ax, 0.50, y5c, 0.72, 0.068,
+     ["Winner:  ST-HeteroSAGE",
+      "MAE 151.08 DKK     RMSE 204.36 DKK     R2 0.696     sMAPE 51.64%",
+      "Spatial-temporal heterogeneous GNN with CausalTCN temporal encoder"],
+     fc="#D5F5E3", ec=C_WIN, lw=2.5,
+     sizes=[12, 9, 8], bold_first=True)
+for cx, _ in ev:
+    arr(ax, cx, y5b - he / 2, 0.50, y5c + 0.034, color=C_WIN, lw=1.0)
 
-for x in [0.14, 0.34, 0.54, 0.74, 0.91]:
-    arrow(ax, x, y5b - (BH + 0.005) / 2,
-          0.50, y5c + (BH + 0.01) / 2, color=C_WINNER, lw=1.0)
+# Dashboard
+y5d = 0.042
+rbox(ax, 0.50, y5d, 0.60, 0.050,
+     ["Streamlit Dashboard",
+      "Feature importance  |  Ablation  |  Robustness  |  Per-zone error  |  Live forecasts"],
+     fc="#FDFEFE", ec="#AAAAAA", lw=1.2, sizes=[9.5, 8])
+arr(ax, 0.50, y5c - 0.034, 0.50, y5d + 0.025, color="#AAAAAA", lw=1.2)
 
-# Streamlit dashboard note
-y5d = 0.065
-box(ax, 0.50, y5d, 0.60, BH,
-    "Streamlit Dashboard",
-    sublabel="Interactive: feature importance · ablation · robustness · per-zone error · forecasts",
-    fc="#FDFCFF", ec="#AAAAAA", lw=1.3, fontsize=9.5, bold=True,
-    subfontsize=8)
-arrow(ax, 0.50, y5c - (BH + 0.01) / 2,
-      0.50, y5d + BH / 2, color="#AAAAAA", lw=1.2)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Legend
-# ─────────────────────────────────────────────────────────────────────────────
-legend_items = [
-    (C_DATA,    "Data Sources"),
-    (C_PIPE,    "Data Pipeline"),
-    (C_HOMO,    "Homogeneous Track"),
-    (C_HETERO,  "Heterogeneous Track"),
-    (C_XGBOOST, "XGBoost Baseline"),
-    (C_EVAL,    "Evaluation"),
-    (C_WINNER,  "Winning Model"),
+# ── Legend ────────────────────────────────────────────────────────────────────
+handles = [
+    mpatches.Patch(fc="#EAF4FB", ec=C_DATA,    label="Data Sources"),
+    mpatches.Patch(fc="#F5EEF8", ec=C_PIPE,    label="Data Pipeline"),
+    mpatches.Patch(fc="#FEF9E7", ec=C_HOMO,    label="Homogeneous Track"),
+    mpatches.Patch(fc="#EAFAF1", ec=C_HETERO,  label="Heterogeneous Track"),
+    mpatches.Patch(fc="#FDEDEC", ec=C_XGB,     label="XGBoost Baseline"),
+    mpatches.Patch(fc="#EAF0FB", ec=C_EVAL,    label="Evaluation"),
+    mpatches.Patch(fc="#D5F5E3", ec=C_WIN,     label="Winning Model"),
 ]
-handles = [mpatches.Patch(facecolor=c, edgecolor="#888888", label=l)
-           for c, l in legend_items]
-ax.legend(handles=handles, loc="lower right",
-          bbox_to_anchor=(0.99, 0.005),
-          ncol=4, fontsize=8, framealpha=0.85,
-          edgecolor="#CCCCCC")
+ax.legend(handles=handles, loc="lower center",
+          bbox_to_anchor=(0.50, -0.012), ncol=7,
+          fontsize=8, framealpha=0.9, edgecolor="#CCCCCC")
 
-plt.tight_layout(rect=[0.03, 0, 1, 0.98])
-plt.savefig(OUT_PATH, dpi=180, bbox_inches="tight",
-            facecolor=C_BG)
+plt.tight_layout(rect=[0.04, 0.01, 1.0, 0.995])
+plt.savefig(OUT_PATH, dpi=180, bbox_inches="tight", facecolor=C_BG)
 plt.close()
-print(f"Saved → {OUT_PATH}")
+print(f"Saved -> {OUT_PATH}")
