@@ -1,370 +1,229 @@
-# electricity-forecasting
-# GNN-Based Electricity Price Forecasting for Denmark
+# Heterogeneous Spatio-Temporal GNNs for Nordic Electricity Price Forecasting
 
-A complete Graph Neural Network (GNN) system for forecasting electricity prices in Denmark using temporal graph structures and real-time data from free APIs.
+Multi-area day-ahead electricity price forecasting for the Nordic power market,
+built around a **heterogeneous spatio-temporal graph neural network**
+(ST-HeteroSAGE) and benchmarked against XGBoost and three GNN baselines.
 
-## 🌟 Features
+> **Research question**
+> *How can a heterogeneous graph be effectively constructed and integrated into
+> GNN models to improve the accuracy, interpretability, and robustness of
+> multi-area day-ahead electricity price forecasting in the Nordic power market?*
 
-- **Homogeneous Temporal Graph**: Each hour is a node with multi-hop temporal connections
-- **Multiple GNN Architectures**: GCN, GAT, GraphSAGE, and GIN
-- **Real-time Data**: Fetches electricity prices and weather data from free APIs
-- **Complete Pipeline**: From data ingestion to prediction and visualization
-- **No API Keys Required**: Uses free public APIs (Energy-Charts and Open-Meteo)
+---
 
-## 📊 Graph Structure
+## 🏆 Results
+
+Test set: chronological 80/10/10 split (test window ≈ Mar–Sep 2025), DK1 + DK2.
+
+| Model | MAE (DKK) | RMSE (DKK) | R² | sMAPE | Notes |
+|-------|-----------|-----------|-----|-------|-------|
+| XGBoost (tabular baseline) | 179.49 | 243.43 | 0.568 | 54.51% | 18 engineered features |
+| Homogeneous GNN (GraphSAGE) | 173.19 | 225.73 | 0.629 | 57.44% | single node type |
+| HeteroSAGE | 162.78 | 213.32 | 0.668 | 52.20% | typed edges, served by the API |
+| **ST-HeteroSAGE (ours ★)** | **151.08** | **204.36** | **0.696** | **51.64%** | CausalTCN + HeteroConv |
+
+ST-HeteroSAGE is **15.8 % better than XGBoost** (MAE) and **12.8 % better than
+the homogeneous GraphSAGE baseline**.
+
+> **GAT note:** A heterogeneous GAT variant (MAE 179.20, R² 0.591) was implemented
+> and explored as a design ablation. It is not included in the main benchmark
+> because it used a different output-head configuration; the experiment showed that
+> attention does not improve on simple aggregation when neighbourhoods are small and
+> curated, isolating the heterogeneous graph structure and CausalTCN as the primary
+> performance drivers.
+
+---
+
+## 📊 The heterogeneous graph
+
+**2 node types, 5 edge relation types.** Four market zones (DK1, DK2, HYDRO, DE)
+share the `hour` node type; zone identity is carried by the block layout and the
+market edges rather than by separate node types.
 
 ### Nodes
-- **Type**: Hourly timesteps
-- **Features** (19 dimensions):
-  - Temporal: hour, day_of_week, month, is_weekend
-  - Lag features: 1h, 2h, 24h, 48h, 168h price lags
-  - Rolling statistics: 6h, 12h, 24h mean and std
-  - Weather: temperature, wind speed, cloud cover, humidity
+| Type | Count | Meaning |
+|------|-------|---------|
+| `hour` | 201,596 | one node per hour per zone (50,399 h × 4 zones) |
+| `market` | 4 | one node per area (NordPool, DK1 area, DK2 area, DE area) |
+
+**17 features per `hour` node:** 5 price lag/rolling (`lag_24h`, `lag_48h`,
+`lag_168h`, `roll24_mean`, `roll24_std`), 4 weather (`temp`, `wind`, `cloud`,
+`humidity`), 4 fundamentals (`load_mwh`, `renewable_mwh`, `gas_dkk`, `co2_dkk`),
+4 cyclical (`hour_sin/cos`, `week_sin/cos`).
 
 ### Edges
-- **Temporal 1h**: Connect consecutive hours (t → t+1)
-- **Temporal 24h**: Connect same hour previous day (t → t+24)
-- **Temporal 168h**: Connect same hour previous week (t → t+168)
-- **Temporal 2h & 6h**: Additional temporal connections
-- **Bidirectional**: All edges are bidirectional
+| Relation | Meaning |
+|----------|---------|
+| `lag_to` | temporal — links an hour to a later hour (24/48/168 h) |
+| `co_occurs_with` | spatial — same-hour price co-movement across zones |
+| `belongs_to` / `rev_belongs_to` | hour ↔ its market node |
+| `interconnects` | market ↔ market (transmission capacity) |
 
-## 🏗️ Architecture
+**Zone-blocked layout** — DK1 = `[0, T)`, DK2 = `[T, 2T)`, HYDRO = `[2T, 3T)`,
+DE = `[3T, 4T)` with `T = 50,399`. This enables the O(1) `view(4, T, H)` reshape
+the CausalTCN uses for per-zone temporal convolution.
+
+> **DE staleness fix:** German prices end 2024-12-31, so DE is deliberately
+> excluded from hour-level `co_occurs_with` edges to stop stale forward-filled
+> 2025 values from leaking into test predictions.
+
+---
+
+## 🧠 ST-HeteroSAGE architecture
+
+Each spatio-temporal block applies **spatial** message passing then a
+**temporal** convolution:
 
 ```
-Data Sources (Energy-Charts + Open-Meteo)
-            ↓
-    SQLite Database
-            ↓
-  Feature Engineering
-            ↓
-   Graph Construction
-            ↓
-   GNN Model Training
-    (GCN/GAT/SAGE/GIN)
-            ↓
- Predictions & Forecasting
-            ↓
-    Visualization
+x_dict ─► HeteroConv (co_occurs_with, belongs_to, interconnects)   ← spatial
+       ─► per-zone CausalTCN (dilations 1,4,24; kernel 7; RF ≈ 174h) ← temporal
+       ─► BatchNorm + residual
+   (×2 ST blocks) ─► regression head ─► price
 ```
 
-## 📦 Installation
+- **CausalTCN** replaces explicit lag edges with a strictly causal 174-hour
+  receptive field — a much richer temporal signal.
+- **BatchNorm, no Dropout** — the two interact adversely (dropout masking
+  corrupts BN statistics); BN alone regularises adequately here.
 
-### 1. Clone the repository
+---
+
+## 📦 Project layout
+
+```
+electricity-forecasting/
+├── src/
+│   ├── hetero_graph_builder.py   # build hetero_graph.pt + scalers from SQLite
+│   ├── hetero_st_model.py        # ST-HeteroSAGE (CausalTCN + HeteroConv)
+│   ├── hetero_models.py          # HeteroSAGE / GAT
+│   ├── st_train.py               # train ST-HeteroSAGE
+│   ├── homo_retrain.py           # homogeneous GraphSAGE baseline
+│   ├── xgboost_baseline.py       # tabular baseline
+│   ├── st_ablation.py            # ablation study
+│   ├── st_interpretability.py    # feature importance + error analysis
+│   ├── st_robustness.py          # perturbation robustness
+│   ├── model_api.py              # FastAPI serving (HeteroSAGE)
+│   ├── dashboard.py              # Streamlit dashboard (7 pages)
+│   ├── pipeline.py               # end-to-end MLOps pipeline
+│   ├── monitoring.py             # rolling MAE + drift
+│   ├── data/graphs_hetero/       # hetero_graph.pt, hetero_scalers.pkl
+│   └── artifacts_hetero/         # checkpoints + metrics JSON
+├── notebooks/
+│   └── ST_HeteroSAGE_Review.ipynb # supervisor technical review (Plotly, live inference)
+├── artifacts/                    # xgboost_baseline.pkl + metrics
+├── Dockerfile                    # CPU-only torch image (Python 3.11)
+├── docker-compose.yml            # mlflow + api + dashboard + training profiles
+└── requirements.txt
+```
+
+---
+
+## 🚀 Quick start
+
+### Option A — Docker (recommended)
+
 ```bash
-git clone <your-repo-url>
-cd gnn-electricity-forecast
+docker compose up --build
 ```
 
-### 2. Create virtual environment
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
+Brings up three services:
 
-### 3. Install dependencies
+| Service | URL | Purpose |
+|---------|-----|---------|
+| MLflow | http://localhost:5000 | experiment tracking |
+| API | http://localhost:8000 | `/predict`, `/metrics`, `/health` (HeteroSAGE) |
+| Dashboard | http://localhost:8501 | Streamlit UI |
+
+### Option B — local
+
 ```bash
+pip install torch==2.2.2+cpu torch-geometric>=2.3.0 \
+  --index-url https://download.pytorch.org/whl/cpu \
+  --extra-index-url https://pypi.org/simple
 pip install -r requirements.txt
+
+# API (terminal 1)
+python src/model_api.py
+# Dashboard (terminal 2) — works even without the API (local XGBoost fallback)
+streamlit run src/dashboard.py --server.port=8501
 ```
 
-### 4. Install PyTorch Geometric
-```bash
-# CPU version
-pip install torch-geometric
+---
 
-# For GPU (CUDA 11.8)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install torch-geometric
-pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
-```
+## 🖥️ Dashboard pages
 
-## 🚀 Quick Start
+1. **Overview & Leaderboard** — 4-model MAE / RMSE / R² / sMAPE comparison
+2. **Graph Structure** — live node/edge stats, spatio-temporal schematic, and an
+   interactive mini-graph (hover any node for its real price / weather)
+3. **Live Prediction** — HeteroSAGE via the API, or a local XGBoost fallback when
+   the API is offline
+4. **Forecast Analysis** — per-zone day-ahead profiles
+5. **Interpretability** — feature importance, error by hour/day
+6. **Robustness** — MAE under noise / dropout / price-spike perturbations
+7. **MLOps & Monitoring** — pipeline status, rolling MAE, drift
 
-### Run Complete Pipeline
-```bash
-python gnn_pipeline.py --zone DK1 --model GCN
-```
+---
 
-### Step-by-Step Execution
-
-#### 1. Data Ingestion (90 days of historical data)
-```bash
-python gnn_data_ingestion.py
-```
-
-#### 2. Build Graph
-```bash
-python gnn_graph_builder.py
-```
-
-#### 3. Train Model
-```bash
-python gnn_train.py
-```
-
-#### 4. Make Predictions
-```bash
-python gnn_predict.py
-```
-
-### Compare Models
-```bash
-python gnn_pipeline.py --compare-models --zone DK1
-```
-
-## 📁 Project Structure
-
-```
-gnn-electricity-forecast/
-├── gnn_config.py              # Configuration settings
-├── gnn_database.py            # Database operations
-├── gnn_data_ingestion.py      # Fetch data from APIs
-├── gnn_feature_engineering.py # Create node features
-├── gnn_graph_builder.py       # Construct temporal graph
-├── gnn_models.py              # GNN architectures
-├── gnn_train.py               # Training pipeline
-├── gnn_predict.py             # Prediction and forecasting
-├── gnn_visualization.py       # Plotting functions
-├── gnn_pipeline.py            # Main pipeline script
-├── requirements.txt           # Python dependencies
-├── README.md                  # This file
-├── data/                      # Data directory (auto-created)
-│   ├── energy.db             # SQLite database
-│   └── graphs/               # Saved graph objects
-└── artifacts/                 # Model outputs (auto-created)
-    ├── best_model.pt         # Best trained model
-    ├── training_history.json # Training metrics
-    ├── pipeline_results.json # Pipeline results
-    └── *.png                 # Visualization plots
-```
-
-## 🔧 Configuration
-
-Edit `gnn_config.py` to customize:
-
-```python
-# Model architecture
-GNN_CONFIG = {
-    "hidden_channels": 128,    # Hidden layer size
-    "num_layers": 3,           # Number of GNN layers
-    "dropout": 0.2,            # Dropout rate
-    "conv_type": "GCN",        # GCN, GAT, GraphSAGE, GIN
-    "num_heads": 4,            # For GAT only
-    
-    # Training
-    "learning_rate": 0.001,
-    "weight_decay": 5e-4,
-    "num_epochs": 100,
-    "early_stopping_patience": 15,
-}
-
-# Graph edges
-EDGE_TYPES = {
-    "temporal_1h": 1,
-    "temporal_24h": 24,
-    "temporal_168h": 168,
-    "temporal_2h": 2,
-    "temporal_6h": 6,
-}
-```
-
-## 📈 Model Performance
-
-### Expected Metrics
-- **MAE**: ~0.04-0.08 DKK/kWh
-- **RMSE**: ~0.06-0.12 DKK/kWh
-- **R²**: 0.90-0.97
-- **MAPE**: 10-25%
-
-### Model Comparison
-Different architectures offer trade-offs:
-- **GCN**: Fast, good baseline performance
-- **GAT**: Attention mechanism, better for complex patterns
-- **GraphSAGE**: Sampling-based, scales well
-- **GIN**: Most expressive, best for capturing graph structure
-
-## 🎯 Use Cases
-
-### 1. Price Forecasting
-```python
-from gnn_predict import GNNPredictor
-
-predictor = GNNPredictor()
-future_forecast = predictor.predict_future(num_hours=24)
-print(future_forecast)
-```
-
-### 2. Find Cheapest Hours
-```python
-cheapest = predictor.get_cheapest_hours(future_forecast, top_n=3)
-print(f"Best time to charge EV: {cheapest}")
-```
-
-### 3. Model Evaluation
-```python
-test_predictions = predictor.predict_test_set()
-from gnn_predict import evaluate_predictions
-metrics = evaluate_predictions(test_predictions)
-```
-
-## 📊 Visualization
-
-The pipeline generates several plots:
-- **Training History**: Loss and MAE curves
-- **Predictions vs Actual**: Time series comparison
-- **Error Distribution**: Histogram and box plot
-- **Hourly Performance**: MAE by hour of day
-- **Future Forecast**: 24-hour ahead prediction
-- **Model Comparison**: Compare GNN architectures
-
-## 🔄 Data Sources
-
-### 1. Energy-Charts API (Fraunhofer ISE)
-- **URL**: https://api.energy-charts.info/
-- **Data**: Spot electricity prices for DK1/DK2
-- **Format**: EUR/MWh (converted to DKK/kWh)
-- **Update**: Hourly
-- **Cost**: Free, no API key
-
-### 2. Open-Meteo
-- **URL**: https://open-meteo.com/
-- **Data**: Weather (temperature, wind, cloud cover, humidity)
-- **Format**: Hourly time series
-- **Coverage**: Historical archive + 2-day forecast
-- **Cost**: Free, no API key
-
-## 🧠 GNN Models
-
-### Graph Convolutional Network (GCN)
-```python
-# Simple and efficient
-# Uses mean aggregation
-model = create_model('GCN', num_features, config)
-```
-
-### Graph Attention Network (GAT)
-```python
-# Learns edge importance
-# Multi-head attention mechanism
-model = create_model('GAT', num_features, config)
-```
-
-### GraphSAGE
-```python
-# Sampling-based approach
-# Scales to large graphs
-model = create_model('GraphSAGE', num_features, config)
-```
-
-### Graph Isomorphism Network (GIN)
-```python
-# Most expressive GNN
-# Best for structural patterns
-model = create_model('GIN', num_features, config)
-```
-
-## 🛠️ Command Line Arguments
+## 🔁 Reproducing the results
 
 ```bash
-python gnn_pipeline.py --help
+cd src
 
-Options:
-  --zone {DK1,DK2}              Price zone (default: DK1)
-  --model {GCN,GAT,GraphSAGE,GIN}  GNN architecture (default: GCN)
-  --skip-ingestion              Skip data fetch if already present
-  --skip-training               Skip training if model exists
-  --no-visualize                Don't generate plots
-  --compare-models              Train and compare all architectures
+# 1 — build the graph from the SQLite DB
+python hetero_graph_builder.py        # → hetero_graph.pt + hetero_scalers.pkl
+
+# 2 — train all models
+python xgboost_baseline.py            # → artifacts/xgboost_metrics.json
+python homo_retrain.py                # → artifacts/homo_gnn_metrics.json
+python hetero_train.py                # → artifacts_hetero/hetero_metrics_clean.json
+python st_train.py                    # → artifacts_hetero/st_hetero_metrics.json (primary model)
+
+# Optional — GAT design ablation (not in main benchmark)
+python gat_train.py                   # → artifacts_hetero/gat_metrics_clean.json
+
+# 3 — post-hoc analyses on the ST checkpoint
+python st_ablation.py                 # → st_ablation_results.json
+python st_interpretability.py         # → st_interpretability.json
+python st_robustness.py               # → st_robustness_results.json
 ```
 
-## 🔬 Advanced Usage
+**Seeding:** `torch.manual_seed(42)` and `np.random.seed(42)` in all GNN scripts;
+XGBoost uses `random_state=42`.
 
-### Custom Graph Structure
-```python
-from gnn_graph_builder import TemporalGraphBuilder
+**Environment:** Python 3.11, PyTorch 2.2 (CPU), PyTorch-Geometric ≥ 2.3,
+XGBoost ≥ 2.0, scikit-learn ≥ 1.8.
 
-builder = TemporalGraphBuilder()
-graph = builder.build_graph(df, train_mask_ratio=0.7)
+---
 
-# Modify edge types
-EDGE_TYPES = {
-    "temporal_1h": 1,
-    "temporal_12h": 12,
-    "temporal_24h": 24,
-}
-```
+## 🔄 Data sources
 
-### Hyperparameter Tuning
-```python
-from gnn_train import train_gnn_model
+| Source | Data | Cost |
+|--------|------|------|
+| Energinet / Nord Pool | DK1, DK2 spot prices, load, renewables | free |
+| Energy-Charts (Fraunhofer ISE) | DE spot prices | free |
+| Open-Meteo | temperature, wind, cloud, humidity | free |
 
-config = {
-    'hidden_channels': 256,
-    'num_layers': 4,
-    'dropout': 0.3,
-    'learning_rate': 0.0005,
-    'num_epochs': 150,
-}
+Coverage: hourly, **2019-12-31 → 2025-09-30** (50,399 hours per zone). All price
+lags are ≥ 24 h (known at gate closure); scalers are fit on the training split
+only; splits are strictly chronological — no leakage.
 
-model, metrics, history = train_gnn_model(
-    graph_data, 
-    model_type='GAT',
-    config=config
-)
-```
+---
 
-## 📝 Citation
+## ⚙️ MLOps
 
-If you use this code in your research, please cite:
+- **MLflow** experiment tracking (file-backed store)
+- **Git-versioned artifacts** — checkpoints, metrics, scalers committed
+- **Manual-dispatch CI/CD** — retraining is triggered explicitly, not on every push; warm-start mode available for incremental updates when new data arrives; full retrain for architecture changes
+- **Condition-gated training** — pipeline skips training automatically if ingestion finds zero new rows
+- **Regression guard** — workflow fails if new MAE exceeds 1.5× previous best
+- **Docker + docker-compose** for reproducible serving and training
+- **Monitoring** — rolling MAE and feature-drift checks via the API
 
-```bibtex
-@software{gnn_electricity_forecast,
-  title={GNN-Based Electricity Price Forecasting for Denmark},
-  author={Your Name},
-  year={2024},
-  url={https://github.com/yourusername/gnn-electricity-forecast}
-}
-```
-
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Open a pull request
-
-## 📄 License
-
-MIT License - see LICENSE file for details
-
-## 🙏 Acknowledgments
-
-- **Energy-Charts API** by Fraunhofer ISE
-- **Open-Meteo** for weather data
-- **PyTorch Geometric** team for the GNN library
-- **Nord Pool** for electricity market data
-
-## 📧 Contact
-
-For questions or issues, please open a GitHub issue or contact [your-email@example.com]
-
-## 🔮 Future Enhancements
-
-- [ ] Add attention visualization
-- [ ] Implement multi-step ahead forecasting
-- [ ] Add heterogeneous graph (multiple node types)
-- [ ] Real-time streaming predictions
-- [ ] REST API for predictions
-- [ ] Web dashboard with Streamlit
-- [ ] Docker containerization
-- [ ] Add more weather features
-- [ ] Include demand forecasting
-- [ ] Multi-zone joint modeling
+---
 
 ## 📚 References
 
-1. Kipf & Welling (2017). Semi-Supervised Classification with Graph Convolutional Networks
-2. Veličković et al. (2018). Graph Attention Networks
-3. Hamilton et al. (2017). Inductive Representation Learning on Large Graphs
-4. Xu et al. (2019). How Powerful are Graph Neural Networks?
+1. Kipf & Welling (2017). *Semi-Supervised Classification with Graph Convolutional Networks.*
+2. Veličković et al. (2018). *Graph Attention Networks.*
+3. Hamilton et al. (2017). *Inductive Representation Learning on Large Graphs* (GraphSAGE).
+4. Bai et al. (2018). *An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling* (TCN).
