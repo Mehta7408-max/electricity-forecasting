@@ -15,16 +15,22 @@ built around a **heterogeneous spatio-temporal graph neural network**
 
 Test set: chronological 80/10/10 split (test window ≈ Mar–Sep 2025), DK1 + DK2.
 
-| Model | MAE (DKK) | RMSE (DKK) | R² | Notes |
-|-------|-----------|-----------|-----|-------|
-| XGBoost (tabular baseline) | 205.62 | 296.41 | 0.520 | 13 engineered features |
-| Homogeneous GNN (GraphSAGE) | 161.91 | 212.53 | 0.671 | single node type |
-| GAT | 179.20 | — | 0.591 | attention, heterogeneous |
-| HeteroSAGE | 162.78 | — | 0.668 | typed edges, served by the API |
-| **ST-HeteroSAGE (ours ★)** | **151.08** | **204.36** | **0.696** | CausalTCN + HeteroConv |
+| Model | MAE (DKK) | RMSE (DKK) | R² | sMAPE | Notes |
+|-------|-----------|-----------|-----|-------|-------|
+| XGBoost (tabular baseline) | 179.49 | 243.43 | 0.568 | 54.51% | 18 engineered features |
+| Homogeneous GNN (GraphSAGE) | 173.19 | 225.73 | 0.629 | 57.44% | single node type |
+| HeteroSAGE | 162.78 | 213.32 | 0.668 | 52.20% | typed edges, served by the API |
+| **ST-HeteroSAGE (ours ★)** | **151.08** | **204.36** | **0.696** | **51.64%** | CausalTCN + HeteroConv |
 
-ST-HeteroSAGE is **26.5 % better than XGBoost** and **6.7 % better than the
-homogeneous GraphSAGE baseline**.
+ST-HeteroSAGE is **15.8 % better than XGBoost** (MAE) and **12.8 % better than
+the homogeneous GraphSAGE baseline**.
+
+> **GAT note:** A heterogeneous GAT variant (MAE 179.20, R² 0.591) was implemented
+> and explored as a design ablation. It is not included in the main benchmark
+> because it used a different output-head configuration; the experiment showed that
+> attention does not improve on simple aggregation when neighbourhoods are small and
+> curated, isolating the heterogeneous graph structure and CausalTCN as the primary
+> performance drivers.
 
 ---
 
@@ -146,7 +152,7 @@ streamlit run src/dashboard.py --server.port=8501
 
 ## 🖥️ Dashboard pages
 
-1. **Overview & Leaderboard** — 5-model MAE / R² comparison
+1. **Overview & Leaderboard** — 4-model MAE / RMSE / R² / sMAPE comparison
 2. **Graph Structure** — live node/edge stats, spatio-temporal schematic, and an
    interactive mini-graph (hover any node for its real price / weather)
 3. **Live Prediction** — HeteroSAGE via the API, or a local XGBoost fallback when
@@ -169,9 +175,11 @@ python hetero_graph_builder.py        # → hetero_graph.pt + hetero_scalers.pkl
 # 2 — train all models
 python xgboost_baseline.py            # → artifacts/xgboost_metrics.json
 python homo_retrain.py                # → artifacts/homo_gnn_metrics.json
-python gat_train.py                   # → artifacts_hetero/gat_metrics_clean.json
 python hetero_train.py                # → artifacts_hetero/hetero_metrics_clean.json
-python st_train.py                    # → artifacts_hetero/st_hetero_metrics.json
+python st_train.py                    # → artifacts_hetero/st_hetero_metrics.json (primary model)
+
+# Optional — GAT design ablation (not in main benchmark)
+python gat_train.py                   # → artifacts_hetero/gat_metrics_clean.json
 
 # 3 — post-hoc analyses on the ST checkpoint
 python st_ablation.py                 # → st_ablation_results.json
@@ -205,7 +213,9 @@ only; splits are strictly chronological — no leakage.
 
 - **MLflow** experiment tracking (file-backed store)
 - **Git-versioned artifacts** — checkpoints, metrics, scalers committed
-- **Warm-start / freeze-scaler** for incremental retraining on new data
+- **Manual-dispatch CI/CD** — retraining is triggered explicitly, not on every push; warm-start mode available for incremental updates when new data arrives; full retrain for architecture changes
+- **Condition-gated training** — pipeline skips training automatically if ingestion finds zero new rows
+- **Regression guard** — workflow fails if new MAE exceeds 1.5× previous best
 - **Docker + docker-compose** for reproducible serving and training
 - **Monitoring** — rolling MAE and feature-drift checks via the API
 
